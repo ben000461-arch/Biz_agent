@@ -1,4 +1,5 @@
-// test-local-model.js
+ // test-local-model.js
+ // This script tests local Ollama models against a set of prompts and reports accuracy.
 //
 // Standalone test — does NOT touch simple-agent/server.js.
 // Sends the exact same classification prompt simple-agent uses to your local
