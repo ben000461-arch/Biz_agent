@@ -142,6 +142,17 @@ export function createStore(file) {
       return true;
     },
 
+    // A few small per-business preferences (which AI to use, whether they've
+    // agreed to cloud AI seeing their task + one file). Nothing else can be set.
+    setPrefs(chatId, patch) {
+      const t = state.tenants[String(chatId)];
+      if (!t) return false;
+      if ('modelChoice' in patch) t.modelChoice = patch.modelChoice === null ? undefined : String(patch.modelChoice).slice(0, 40);
+      if ('cloudOk' in patch) t.cloudOk = Boolean(patch.cloudOk);
+      save();
+      return true;
+    },
+
     setTools(chatId, groups) {
       const t = state.tenants[String(chatId)];
       if (!t) return false;

@@ -32,6 +32,8 @@ import { createStore, ALL_TOOL_GROUPS } from './tenants.js';
 import { createVault } from './vault.js';
 import { createGoogle, NeedsReconnect } from './google.js';
 import { createGitHub, readPrivateKey } from './github.js';
+import { runCodeTask, parseCodeRequest } from './coder.js';
+import { createModelConnector, extractJson, PROVIDERS } from './models.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,6 +45,12 @@ const {
   TELEGRAM_API_BASE = 'https://api.telegram.org',
   OLLAMA_HOST = 'http://127.0.0.1:11434',
   OLLAMA_MODEL = 'llama3.2:3b',
+  CODE_MODEL = OLLAMA_MODEL, // local model for coding when no cloud model is connected (an 8 GB computer can't run a bigger one)
+  MODEL_DAILY_TASKS = '25', // cap on coding tasks per business per day when they use THEIR OWN key
+  MANAGED_DAILY_TASKS = '10', // per business per day on the shared (admin-paid) models
+  MANAGED_GLOBAL_DAILY_TASKS = '100', // all businesses together per day on the shared models
+  MODELS_FILE,
+  ANTHROPIC_API_BASE, OPENAI_API_BASE, OPENROUTER_API_BASE, GROQ_API_BASE, // test overrides
   TENANTS_FILE,
   WORKSPACES_DIR,
   PORT = 3000,
@@ -87,6 +95,7 @@ if (!TELEGRAM_WEBHOOK_SECRET) {
 let vault = null;
 let google = null;
 let github = null;
+let aiModel = null; // optional cloud model (coding, etc.)
 if (TOKEN_ENCRYPTION_KEY || PUBLIC_URL) {
   if (TOKEN_ENCRYPTION_KEY && PUBLIC_URL) {
     try {
@@ -129,6 +138,29 @@ if (vault) {
     } else {
       console.warn('GitHub connection off: set GITHUB_APP_ID, GITHUB_APP_SLUG, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and GITHUB_APP_PRIVATE_KEY_PATH in .env to turn it on.');
     }
+  }
+}
+
+if (vault) {
+  aiModel = createModelConnector({
+    vault,
+    publicUrl: PUBLIC_URL,
+    catalogFile: MODELS_FILE || path.join(__dirname, 'data', 'models.json'),
+    dailyLimit: Number(MODEL_DAILY_TASKS) > 0 ? Number(MODEL_DAILY_TASKS) : 25,
+    managedDailyLimit: Number(MANAGED_DAILY_TASKS) > 0 ? Number(MANAGED_DAILY_TASKS) : 10,
+    managedGlobalLimit: Number(MANAGED_GLOBAL_DAILY_TASKS) > 0 ? Number(MANAGED_GLOBAL_DAILY_TASKS) : 100,
+    bases: { anthropic: ANTHROPIC_API_BASE, openai: OPENAI_API_BASE, openrouter: OPENROUTER_API_BASE, groq: GROQ_API_BASE },
+  });
+  // Optional shortcut: a provider key in .env (git-ignored) is moved into the encrypted vault at startup.
+  // After the first successful start you can delete the key line from .env; the vault keeps it.
+  if (process.env.GROQ_API_KEY) {
+    aiModel.importManaged({
+      provider: 'groq',
+      apiKey: process.env.GROQ_API_KEY,
+      model: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
+      label: process.env.GROQ_LABEL || 'Intel',
+    }).then((status) => console.log(`Groq key from .env: ${status}`))
+      .catch((err) => console.log(`Groq key from .env: failed (${err.message})`));
   }
 }
 
@@ -213,15 +245,15 @@ async function getBotUsername() {
 // Local model
 // ---------------------------------------------------------------------------
 
-async function callLocalModel(systemPrompt, userText) {
+async function callLocalModel(systemPrompt, userText, { model = OLLAMA_MODEL, timeoutMs = 90_000 } = {}) {
   let res;
   try {
     res = await fetch(`${OLLAMA_HOST}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(90_000), // never let a hung model block a chat forever
+      signal: AbortSignal.timeout(timeoutMs), // never let a hung model block a chat forever
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userText },
@@ -240,6 +272,62 @@ async function callLocalModel(systemPrompt, userText) {
   const data = await res.json();
   return JSON.parse(data.message.content);
 }
+
+// Answer from the bigger coding model. It is STREAMED: a non-streamed request
+// stays silent until the whole answer is done, and Node drops a connection that
+// is silent for 5 minutes — which is exactly what happened on a slow computer.
+// A big window so a whole file fits; the long timeout covers loading the model.
+async function callCodeText(systemPrompt, userText, { json = false } = {}) {
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(900_000),
+      body: JSON.stringify({
+        model: CODE_MODEL,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userText }],
+        stream: true,
+        keep_alive: '30m', // stay loaded between tasks so the next one starts fast
+        ...(json ? { format: 'json' } : {}),
+        options: { temperature: 0.1, num_ctx: 8192, num_predict: 4096 },
+      }),
+    });
+  } catch (err) {
+    const why = err.name === 'TimeoutError' ? 'it took too long to start answering' : `${err.name}${err.cause?.code ? ` ${err.cause.code}` : ''}`;
+    throw new Error(`Couldn't reach the coding model (${why}) — is "ollama serve" running and is ${CODE_MODEL} installed?`);
+  }
+  if (!res.ok) throw new Error(`Ollama API error: ${res.status} ${await res.text()} — try: ollama pull ${CODE_MODEL}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let out = '';
+  const take = (line) => {
+    if (!line.trim()) return;
+    let j;
+    try { j = JSON.parse(line); } catch { return; }
+    if (j.error) throw new Error(`Ollama error: ${j.error}`);
+    out += j.message?.content || '';
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        take(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+      }
+    }
+    take(buf);
+  } catch (err) {
+    if (err.message.startsWith('Ollama error')) throw err;
+    throw new Error(`The coding model stopped answering partway (${err.name}${err.cause?.code ? ` ${err.cause.code}` : ''}).`);
+  }
+  return out;
+}
+const callCodeJson = async (system, user) => JSON.parse(await callCodeText(system, user, { json: true }));
 
 // ---------------------------------------------------------------------------
 // Per-business workspace + tools
@@ -449,7 +537,158 @@ async function doDisconnect(tenant, provider) {
     await github.disconnect(tenant.chatId);
     return 'Disconnected — I removed the GitHub app from your account, so I can no longer see any projects.';
   }
+  if (provider === 'model' && aiModel?.hasOwn(tenant.chatId)) {
+    const m = aiModel.describeOwn(tenant.chatId);
+    aiModel.disconnectOwn(tenant.chatId);
+    return `Done — I deleted the ${m.providerLabel} key from my vault, so I can't use it any more. To be thorough, also delete that key in ${m.providerLabel}'s dashboard.`;
+  }
   return 'That was already disconnected.';
+}
+
+// The shared AI key stopped working: tell the admin (at most once an hour).
+let lastAdminAlert = 0;
+function notifyAdminOnce(text) {
+  if (!ADMIN_ID || Date.now() - lastAdminAlert < 60 * 60 * 1000) return;
+  lastAdminAlert = Date.now();
+  sendTelegramMessage(ADMIN_ID, `⚠️ ${text}`).catch(() => {});
+}
+
+
+// ---- Saved changes: find earlier /code results again, and push one later ----
+// Every /code result is saved with a proposal.json. /changes lists the recent ones; /push_<id> asks
+// whether to push one (same yes/no and same checks as right after /code).
+function savedChanges(tenant, limit = 5) {
+  const root = path.resolve(workspaceFor(tenant), 'code');
+  const found = [];
+  let repos = [];
+  try { repos = fs.readdirSync(root); } catch { return found; }
+  for (const repo of repos) {
+    let stamps = [];
+    try { stamps = fs.readdirSync(path.join(root, repo)); } catch { continue; }
+    for (const stamp of stamps) {
+      const dir = path.join(root, repo, stamp);
+      try {
+        const p = JSON.parse(fs.readFileSync(path.join(dir, 'proposal.json'), 'utf8'));
+        const updated = path.resolve(String(p.updatedPath || ''));
+        if (!updated.startsWith(dir + path.sep) || !fs.existsSync(updated)) continue; // only files inside this tenant's own folder
+        let pushedUrl = null;
+        try { pushedUrl = fs.readFileSync(path.join(dir, 'pushed.txt'), 'utf8').trim() || 'yes'; } catch { /* not pushed */ }
+        found.push({ id: stamp.toLowerCase().replace(/[^a-z0-9]+/g, '_'), proposal: { ...p, updatedPath: updated, dir }, savedAt: Number(p.savedAt) || 0, pushedUrl });
+      } catch { /* not a saved change */ }
+    }
+  }
+  return found.sort((a, b) => b.savedAt - a.savedAt).slice(0, limit);
+}
+const changeLine = (c) => `${c.proposal.isNew ? 'new file ' : ''}${c.proposal.filePath} in ${c.proposal.repo} — +${c.proposal.added}${c.proposal.removed ? ` −${c.proposal.removed}` : ''}, saved ${new Date(c.savedAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}${c.proposal.syntaxOk === false ? ' ⚠️ failed the syntax check' : ''}${c.pushedUrl ? ' ✓ already pushed' : ''}`;
+
+// A message that is clearly "push it" but isn't a command: never something a chat model should answer.
+const PUSH_INTENT_RE = /^(please[, ]+)?((go ahead|can you|could you|would you|let'?s|i want you to|i'd like you to|you can)( and)?[, ]+)?(push|commit|merge|deploy)\b/i;
+
+// ---- Coding tasks: read the project, save the changed file locally ----
+async function codeTaskAction(tenant, { repo, task, fileHint }) {
+  if (!github) return { text: "GitHub isn't set up on this server yet." };
+  if (!github.isConnected(tenant.chatId)) return { text: "GitHub isn't connected yet — send /connect github to link it." };
+  if (!String(task || '').trim()) return { text: 'What should I do? For example: /code in my app project, fix the bug in server.js where it crashes on an empty message.' };
+  // Which AI does the heavy lifting? The business's own pick (see /model):
+  // a shared cloud model, their own key, or the local model. Cloud use is capped.
+  let callJson = callCodeJson;
+  let callText = callCodeText;
+  let maxChars;
+  // Coding goes to the cloud model (their pick from /model, else their own key, else the shared default).
+  // The local model stays the front for chat and everything else; it only writes code when there is no
+  // cloud model, or they chose local-only with /model_local.
+  const sel = aiModel ? aiModel.resolve(tenant.chatId, tenant.modelChoice, { helper: true }) : null;
+  if (sel) {
+    // A shared cloud model means their task + one file leave this computer, so
+    // a business says yes once first (the owner of the bot doesn't need to ask themselves).
+    if (sel.kind === 'managed' && !tenant.isAdmin && !tenant.cloudOk) {
+      pendingActions.set(String(tenant.chatId), { action: 'cloud_ok', args: { repo, task, fileHint }, createdAt: Date.now() });
+      return { text: `For coding I'd use ${sel.label}, a cloud AI from ${sel.providerLabel}. To do the job I send it your task and the one file I'm working on — nothing else.\n\nIs that OK? (yes/no)\n\nYou can switch any time with /model, including to the free local model (slower and more basic).` };
+    }
+    const slot = aiModel.reserveTask(tenant.chatId, sel);
+    if (!slot.ok) {
+      return { text: slot.why === 'global'
+        ? "The shared AI has reached its limit for today. Try again tomorrow, or use /model_local (slower) in the meantime."
+        : `You've used today's ${slot.limit} coding tasks on ${sel.kind === 'own' ? 'your own key' : 'the shared AI'}. It resets tomorrow (UTC).${sel.kind === 'managed' ? ' You can use /model_local (slower) or add your own key with /connect model.' : ''}` };
+    }
+    callText = (system, user) => aiModel.complete(tenant.chatId, sel, { system, user, maxTokens: 6000 });
+    callJson = async (system, user) => extractJson(await aiModel.complete(tenant.chatId, sel, { system, user, maxTokens: 1500 }));
+    maxChars = 60_000;
+  }
+  await sendTelegramMessage(tenant.chatId, sel
+    ? `On it — using ${sel.label}. I'm sending it the task and the one file I'm working on. I'll show you the result first and won't touch GitHub unless you say yes.`
+    : "On it — reading the project and writing the change with the local model. This can take a few minutes on a small computer. I'll show you the result first and won't touch GitHub unless you say yes.");
+  // Slow computers can take several minutes — say so now and then, so it
+  // doesn't look dead.
+  let pings = 0;
+  const ping = setInterval(() => {
+    pings += 1;
+    if (pings > 4) return clearInterval(ping);
+    sendTelegramMessage(tenant.chatId, pings === 1 ? 'Still working on it…' : 'Still going — this is a big job. Hang tight.').catch(() => {});
+  }, 100_000);
+  try {
+    const result = await runCodeTask(
+      {
+        github,
+        chatId: tenant.chatId,
+        callJson,
+        callText,
+        maxChars,
+        outRoot: path.join(workspaceFor(tenant), 'code'),
+        showPaths: tenant.isAdmin,
+      },
+      { repo, task, fileHint },
+    );
+    // Offer to push — but never do it without a yes. Whatever is pushed is the
+    // exact saved file the person just saw (checked again by hash at push time).
+    if (result.proposal && result.proposal.syntaxOk === false) {
+      // A change that doesn't even parse is not something to push. Keep it as a saved file only.
+      result.text += "\n\nI'm not offering to push this one because the syntax check failed. It's saved so you can look at it, and nothing was sent to GitHub. Try the same /code again, or see /model to change which AI writes code.";
+    } else if (result.proposal) {
+      const pr = result.proposal;
+      pendingActions.set(String(tenant.chatId), { action: 'push_change', args: { proposal: pr }, createdAt: Date.now() });
+      result.text += `\n\nWant me to push this? Reply yes and I'll put ${pr.isNew ? 'the new file' : `these ${pr.added} added line${pr.added === 1 ? '' : 's'}`} on a NEW branch in ${pr.repo} and open a pull request — your main branch isn't touched until you merge it. Reply no to keep it only as a saved file. (This offer stays open for an hour — after 10 minutes I'll ask you to say "push it".)`;
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof NeedsReconnect) return { text: 'The GitHub connection is gone (the app may have been uninstalled) — send /connect github to reconnect.' };
+    if (err?.adminText) notifyAdminOnce(err.adminText); // the shared key broke — the business can't fix that, the admin can
+    if (err?.userFacing) return { text: err.message }; // e.g. the AI key was rejected — safe and useful to show
+    throw err;
+  } finally {
+    clearInterval(ping);
+  }
+}
+
+// Runs only after a "yes". Pushes the saved file to a new branch + pull request.
+async function pushChangeAction(tenant, pr) {
+  if (!github || !github.isConnected(tenant.chatId)) return { text: "GitHub isn't connected anymore — send /connect github, then ask me for the change again." };
+  let content;
+  try {
+    content = fs.readFileSync(pr.updatedPath, 'utf8');
+  } catch {
+    return { text: "I can't find the saved file anymore, so I didn't push anything. Ask me for the change again." };
+  }
+  // The saved file must be exactly what the person approved.
+  if (crypto.createHash('sha256').update(content).digest('hex') !== pr.hash) {
+    return { text: 'The saved file was changed after I showed it to you, so I did not push it. Ask me again if you want it pushed.' };
+  }
+  try {
+    const r = await github.pushChange(tenant.chatId, pr.repo, {
+      filePath: pr.filePath,
+      content,
+      baseSha: pr.baseSha,
+      title: pr.title,
+      branchHint: pr.task,
+      body: `${pr.summary ? `${pr.summary}\n\n` : ''}Task: ${pr.task}\n\nOpened by Biz Agent after ${tenant.isAdmin ? 'the owner' : tenant.name} approved it in chat. Please review before merging.${pr.syntaxOk === false ? '\n\n⚠️ The automatic syntax check flagged a problem in this file.' : ''}`,
+    });
+    if (r.error) return { text: `${r.error}${r.branch ? `\n(Branch ${r.branch} was created on GitHub.)` : ''}` };
+    if (pr.dir) { try { fs.writeFileSync(path.join(pr.dir, 'pushed.txt'), `${r.url}\n`); } catch { /* cosmetic */ } }
+    return { text: `Pushed ✓ I opened pull request #${r.number} in ${r.repo} (branch ${r.branch}).\n${r.url}\nNothing is live until you merge it on GitHub.` };
+  } catch (err) {
+    if (err instanceof NeedsReconnect) return { text: 'The GitHub connection is gone (the app may have been uninstalled) — send /connect github to reconnect.' };
+    throw err;
+  }
 }
 
 // ---- GitHub (read-only) ----
@@ -499,7 +738,7 @@ const ACTION_GROUP = {
   draft_email: 'email',
   write_excel: 'spreadsheets', view_excel: 'spreadsheets', edit_excel: 'spreadsheets',
   list_events: 'calendar',
-  list_repos: 'github', list_prs: 'github', build_status: 'github',
+  list_repos: 'github', list_prs: 'github', build_status: 'github', code_task: 'github',
 };
 
 async function interpretCommand(tenant, text) {
@@ -514,6 +753,7 @@ async function interpretCommand(tenant, text) {
     ? `- "list_repos": the message asks which projects/repos/repositories you can see.
 - "list_prs": the message asks about open pull requests (PRs). Extract "repo" (the project name they mention, or null).
 - "build_status": the message asks if the build/tests/CI are passing or failing. Extract "repo" (or null).
+- "code_task": the message asks you to write, fix, change or add CODE in a project (fix a bug, add a function, edit a source file). Extract "task" (what to do, in their words), "repo" (or null) and "filename" (the code file they mention, or null).
 `
     : '';
 
@@ -532,7 +772,7 @@ async function interpretCommand(tenant, text) {
 ${ghLines}- "chat": anything else — a greeting, small talk, a question about you, opinions, or a request you can't do with the actions above. Use "chat" whenever nothing else clearly fits. No other fields needed.
 Rule: if a filename ending in ".xlsx" (or the message otherwise clearly refers to an existing spreadsheet) appears anywhere in the message, ALWAYS choose "edit_excel", never "write_file" and never "write_excel".
 Rule: if the word "file" appears with a ".txt" name, or a plain text document is described with no spreadsheet mentioned, choose "write_file", never "add_note".
-Respond ONLY with valid JSON: {"action": "add"|"multiply"|"weather"|"add_note"|"list_notes"|"write_file"|"draft_email"|"write_excel"|"view_excel"|"edit_excel"|"list_events"${gh ? '|"list_repos"|"list_prs"|"build_status"' : ''}|"chat", "a": number|null, "b": number|null, "location": string|null, "note": string|null, "filename": string|null, "file_content": string|null, "recipient": string|null, "email_subject": string|null, "email_body": string|null, "sheet_rows": array|null, "when": string|null${gh ? ', "repo": string|null' : ''}}`;
+Respond ONLY with valid JSON: {"action": "add"|"multiply"|"weather"|"add_note"|"list_notes"|"write_file"|"draft_email"|"write_excel"|"view_excel"|"edit_excel"|"list_events"${gh ? '|"list_repos"|"list_prs"|"build_status"|"code_task"' : ''}|"chat", "a": number|null, "b": number|null, "location": string|null, "note": string|null, "filename": string|null, "file_content": string|null, "recipient": string|null, "email_subject": string|null, "email_body": string|null, "sheet_rows": array|null, "when": string|null${gh ? ', "repo": string|null, "task": string|null' : ''}}`;
 
   return callLocalModel(systemPrompt, text);
 }
@@ -546,8 +786,9 @@ async function chatReply(tenant, userText) {
     : ` You work for a business called "${tenant.name}".${tenant.instructions ? ` Owner's notes: ${tenant.instructions}` : ''}`;
   const systemPrompt = `You are a friendly, concise assistant that people text on their phone.${about}
 Reply in ONE short sentence (two at most, under 25 words), like a real person texting back. No lists, no paragraphs, no tutorials. When it fits, end with a short question.
-You can only do these things: draft emails, create and update spreadsheets, save text files, check their calendar${github?.isConnected(tenant.chatId) ? ', and look at their GitHub projects (open pull requests, build status)' : ''}. If asked for something else (writing code, browsing the internet, calling someone), say plainly you can't do that here and mention what you can help with.
-If they bring up coding or dev work, don't teach anything — offer to talk it through and ask what they want to build.
+You can only do these things: draft emails, create and update spreadsheets, save text files, check their calendar${github?.isConnected(tenant.chatId) ? ', look at their GitHub projects (open pull requests, build status), and make small code changes (shown first, and pushed as a pull request only if they say yes)' : ''}. If asked for something else (browsing the internet, calling someone), say plainly you can't do that here and mention what you can help with.
+Never say you are pushing, sending, saving or waiting for a confirmation — a chat reply can't do any of that. If they ask to push code, tell them to send /changes.
+If they bring up coding or dev work, don't teach anything — tell them to send /code followed by what they want done, for example: /code in myapp, fix the crash in server.js.
 Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
   try {
     const out = await callLocalModel(systemPrompt, userText);
@@ -576,6 +817,17 @@ async function executeAction(tenant, action, args) {
   if (action === 'disconnect') return { text: await doDisconnect(tenant, args.provider) };
   if (action === 'list_events') return { text: await calendarSummary(tenant, when) };
   if (['list_repos', 'list_prs', 'build_status'].includes(action)) return { text: await githubReply(tenant, action, repo) };
+  if (action === 'push_change') return pushChangeAction(tenant, args.proposal);
+  if (action === 'cloud_ok') {
+    store.setPrefs(tenant.chatId, { cloudOk: true });
+    return codeTaskAction(tenant, { repo: args.repo, task: args.task, fileHint: args.fileHint });
+  }
+  if (action === 'remove_model' && aiModel) {
+    const m = aiModel.models().find((x) => x.id === args.id);
+    if (!m || !aiModel.removeModel(args.id)) return { text: "That model isn't on the list any more." };
+    return { text: `Removed "${m.label}" from the menu.${aiModel.models().some((x) => x.provider === m.provider) ? '' : ` I also deleted the saved ${m.providerLabel} key — delete it in ${m.providerLabel}'s dashboard too.`}` };
+  }
+  if (action === 'code_task') return codeTaskAction(tenant, { repo, task: args.task, fileHint: filename });
   if (action === 'draft_email' && email_subject && email_body) return draftEmailAction(tenant, recipient, email_subject, email_body);
   if (action === 'write_file' && file_content) return writeTextFile(tenant, filename, file_content);
   if (action === 'write_excel' && sheet_rows?.length > 0) return writeExcelFile(tenant, filename, sheet_rows);
@@ -647,8 +899,9 @@ function helpText(tenant) {
   if (has('calendar') && google) lines.push('• Calendar — "what\'s on my calendar today?"');
   if (lines.length === 1) return "Nothing is switched on for your account yet — ask the person who set you up.";
   lines.push("I'll always check with you before changing a file.");
-  if (github?.isConnected(tenant.chatId) && has('github')) lines.push('• GitHub — "what pull requests are open?", "is the build passing?"');
-  if (google || github) lines.push("Send /connect to link your accounts, and /connections to see what's linked.");
+  if (github?.isConnected(tenant.chatId) && has('github')) lines.push('• GitHub — "what pull requests are open?", "is the build passing?"', '• Code — "/code in myapp, fix the crash in server.js" (I show you the change, and only push it as a pull request if you say yes; /changes lists saved ones)');
+  if (aiModel && github?.isConnected(tenant.chatId) && has('github')) lines.push('Send /model to choose which AI does the coding.');
+  if (google || github || aiModel) lines.push("Send /connect to link your accounts, and /connections to see what's linked.");
   return lines.join('\n');
 }
 
@@ -662,13 +915,119 @@ async function handleCommand({ chatId, text, isAdmin }) {
   const arg = text.slice(rawCmd.length).trim();
   const tenant = store.get(chatId);
 
-  const adminOnly = new Set(['/invite', '/businesses', '/remove', '/tools']);
+  const adminOnly = new Set(['/invite', '/businesses', '/remove', '/tools', '/addmodel', '/models']);
   if (adminOnly.has(cmd) && !isAdmin) {
     await sendTelegramMessage(chatId, "That command isn't available.");
     return true;
   }
 
+  // Tappable per-model commands: /model_smart, /defaultmodel_smart, /removemodel_smart
+  const tap = /^\/(model|defaultmodel|removemodel)_([a-z0-9_]{1,30})$/.exec(cmd);
+  if (tap) {
+    const [, kind, id] = tap;
+    if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+    if (!aiModel) { await sendTelegramMessage(chatId, "AI models aren't set up on this server yet."); return true; }
+    if (kind !== 'model' && !isAdmin) { await sendTelegramMessage(chatId, "That command isn't available."); return true; }
+    if (kind === 'defaultmodel') {
+      await sendTelegramMessage(chatId, aiModel.setDefault(id) ? 'Done — that is now the default for businesses that haven\'t picked.' : "I don't see that model. Check /models.");
+      return true;
+    }
+    if (kind === 'removemodel') {
+      const m = aiModel.models().find((x) => x.id === id);
+      if (!m) { await sendTelegramMessage(chatId, "I don't see that model. Check /models."); return true; }
+      pendingActions.set(String(chatId), { action: 'remove_model', args: { id }, createdAt: Date.now() });
+      await sendTelegramMessage(chatId, `Remove "${m.label}" from the menu? Businesses using it will fall back to another model or the local one.\n\nGo ahead? (yes/no)`);
+      return true;
+    }
+    // /model_<choice>: a business picks what to use for coding
+    const menu = aiModel.models().filter((m) => m.ready);
+    if (id === 'auto') {
+      store.setPrefs(chatId, { modelChoice: 'auto' });
+      const helper = aiModel.resolve(chatId, 'auto', { helper: true });
+      await sendTelegramMessage(chatId, helper
+        ? `Okay — automatic. Code goes to ${helper.label} (a cloud AI): it gets your task and the one file I'm working on, nothing else${tenant.cloudOk || tenant.isAdmin ? '' : " (I'll ask you once first)"}. The local model keeps handling chat and everything else.`
+        : "Okay — automatic. No cloud AI is set up yet, so the local model writes the code for now.");
+    } else if (id === 'local') {
+      store.setPrefs(chatId, { modelChoice: 'local' });
+      await sendTelegramMessage(chatId, "Okay — I'll use only the local model for coding. It's free but slower and more basic, and nothing leaves this computer, even for big files.");
+    } else if (id === 'own') {
+      if (!aiModel.hasOwn(chatId)) { await sendTelegramMessage(chatId, "You haven't added your own key yet — send /connect model."); return true; }
+      store.setPrefs(chatId, { modelChoice: 'own' });
+      await sendTelegramMessage(chatId, "Okay — I'll use your own key for coding. The task and the one file I'm working on go to your provider, and you pay them.");
+    } else {
+      const m = menu.find((x) => x.id === id);
+      if (!m) { await sendTelegramMessage(chatId, "I don't see that one. Send /model to see the list."); return true; }
+      store.setPrefs(chatId, { modelChoice: id });
+      await sendTelegramMessage(chatId, `Okay — I'll use ${m.label} for coding. The task and the one file I'm working on go to ${m.providerLabel}${tenant.cloudOk || tenant.isAdmin ? '' : ' (I\'ll ask you once before the first time)'}.`);
+    }
+    return true;
+  }
+
+  // /push_<id>: push one of the saved changes listed by /changes (asks first, same as right after /code)
+  const pushTap = /^\/push_([a-z0-9_]{6,60})$/.exec(cmd);
+  if (pushTap) {
+    if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+    if (!github?.isConnected(chatId) || !tenant.tools.includes('github')) { await sendTelegramMessage(chatId, "GitHub isn't connected for your account yet — send /connect github first."); return true; }
+    const c = savedChanges(tenant, 50).find((x) => x.id === pushTap[1]);
+    const p = c?.proposal;
+    if (!c || !/^[\w.-]+\/[\w.-]+$/.test(String(p.repo)) || !p.filePath || /(^|\/)\.\.(\/|$)|^\//.test(String(p.filePath))) { await sendTelegramMessage(chatId, "I can't find that saved change. Send /changes to see the recent ones."); return true; }
+    if (p.syntaxOk === false) { await sendTelegramMessage(chatId, "That one failed the syntax check, so I won't push it. Run the /code again to get a fresh version."); return true; }
+    pendingActions.set(String(chatId), { action: 'push_change', args: { proposal: p }, createdAt: Date.now() });
+    await sendTelegramMessage(chatId, `Push this change?\n\n${changeLine(c)}\n"${p.task}"\n\nI'd put it on a NEW branch in ${p.repo} and open a pull request — your main branch isn't touched until you merge it.${c.pushedUrl ? '\n(It was already pushed once — this would open another pull request.)' : ''}\n\nReply yes to push. Anything else cancels.`);
+    return true;
+  }
+
   switch (cmd) {
+    case '/changes': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      const list = savedChanges(tenant);
+      await sendTelegramMessage(chatId, list.length
+        ? `Recent changes I've saved (nothing is pushed unless it says so). Tap one to push it as a pull request — I'll ask first:\n\n${list.map((c, i) => `${i + 1}. ${changeLine(c)}\n/push_${c.id}`).join('\n\n')}`
+        : "I don't have any saved changes yet. Ask for one with /code.");
+      return true;
+    }
+
+    case '/model': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      if (!aiModel) { await sendTelegramMessage(chatId, "AI models aren't set up on this server yet."); return true; }
+      const cur = aiModel.resolve(chatId, tenant.modelChoice);
+      const helper = aiModel.resolve(chatId, tenant.modelChoice, { helper: true });
+      const menu = aiModel.models().filter((m) => m.ready);
+      const own = aiModel.describeOwn(chatId);
+      const mark = (on) => (on ? ' ✓' : '');
+      const isLocalOnly = tenant.modelChoice === 'local';
+      const isAuto = !cur && !isLocalOnly;
+      const now = cur ? cur.label : isLocalOnly ? 'the local model only' : helper ? `${helper.label} (automatic)` : 'the local model';
+      const lines = [`Which AI should write code for you? Right now: ${now}. (The local model still handles chat and everything else.)`, ''];
+      lines.push(`/model_auto — Automatic: code goes to ${helper ? helper.label : 'a cloud AI when one is set up'}; the local model handles everything else${mark(isAuto)}`);
+      lines.push(`/model_local — Local model only for code too: free, slower, more basic, nothing ever leaves this computer${mark(isLocalOnly)}`);
+      for (const m of menu) lines.push(`/model_${m.id} — Always ${m.label} (${m.providerLabel})${mark(cur?.kind === 'managed' && cur.id === m.id)}`);
+      if (own) lines.push(`/model_own — Always your own key (${own.providerLabel} · ${own.model})${mark(cur?.kind === 'own')}`);
+      if (!menu.length && !own) lines.push('', 'No cloud AI is set up yet. The person running the bot can add one, or you can add your own key with /connect model.');
+      else lines.push('', "Cloud AIs get your task and the one file I'm working on — nothing else. I'll ask once before the first time.");
+      await sendTelegramMessage(chatId, lines.join('\n'));
+      return true;
+    }
+
+    case '/addmodel': {
+      if (!aiModel) { await sendTelegramMessage(chatId, "Connections aren't set up on this server yet."); return true; }
+      await sendTelegramMessage(chatId, `Tap to add a model for ALL businesses to choose from (link works for 10 minutes). You'll type the API key into a hidden box — it never passes through this chat — and you pay that provider for what's used. Limits: ${MANAGED_DAILY_TASKS} coding tasks per business per day, ${MANAGED_GLOBAL_DAILY_TASKS} in total.\n${aiModel.startSetup(chatId, { managed: true })}`);
+      return true;
+    }
+
+    case '/models': {
+      if (!aiModel) { await sendTelegramMessage(chatId, "Connections aren't set up on this server yet."); return true; }
+      const list = aiModel.models();
+      if (!list.length) { await sendTelegramMessage(chatId, 'No shared models yet. Send /addmodel to add one.'); return true; }
+      await sendTelegramMessage(chatId, [
+        'Shared models businesses can choose from:',
+        ...list.map((m) => `• ${m.label} — ${m.providerLabel} · ${m.model}${m.isDefault ? ' — default' : ''}${m.ready ? '' : ' — ⚠️ key missing'}\n   /defaultmodel_${m.id}   /removemodel_${m.id}`),
+        '',
+        `Used today across all businesses: ${aiModel.usageToday()} coding tasks (limits: ${MANAGED_DAILY_TASKS} per business, ${MANAGED_GLOBAL_DAILY_TASKS} total). Add another with /addmodel.`,
+      ].join('\n'));
+      return true;
+    }
+
     case '/start': {
       if (tenant) {
         await sendTelegramMessage(chatId, `Welcome back${tenant.isAdmin ? '' : `, ${tenant.name}`}! ${helpText(tenant)}`);
@@ -688,6 +1047,26 @@ async function handleCommand({ chatId, text, isAdmin }) {
       await sendTelegramMessage(chatId, `Hi ${t.name}! You're all set. Just text me what you need.\n\n${helpText(t)}`);
       if (ADMIN_ID && String(chatId) !== ADMIN_ID) {
         await sendTelegramMessage(ADMIN_ID, `✅ ${t.name} just signed up (chat ${t.chatId}).`);
+      }
+      return true;
+    }
+
+    case '/code': {
+      if (!tenant) {
+        await sendTelegramMessage(chatId, INVITE_ONLY_MSG);
+        return true;
+      }
+      if (!github?.isConnected(chatId) || !tenant.tools.includes('github')) {
+        await sendTelegramMessage(chatId, "GitHub isn't connected for your account yet — send /connect github first.");
+        return true;
+      }
+      const req = parseCodeRequest(arg);
+      try {
+        const result = await codeTaskAction(tenant, { repo: req.repo, task: req.task, fileHint: req.fileHint });
+        await deliver(chatId, tenant, result);
+      } catch (err) {
+        console.error(`Error in /code for chat ${chatId}:`, err);
+        await sendTelegramMessage(chatId, tenant.isAdmin ? `Ran into a snag on my end: ${err.message}` : 'Something went wrong on my end — please try again in a moment.');
       }
       return true;
     }
@@ -720,10 +1099,10 @@ async function handleCommand({ chatId, text, isAdmin }) {
 
     case '/connect': {
       if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
-      if (!google && !github) { await sendTelegramMessage(chatId, "Connections aren't set up on this server yet."); return true; }
+      if (!google && !github && !aiModel) { await sendTelegramMessage(chatId, "Connections aren't set up on this server yet."); return true; }
       const want = arg.toLowerCase();
-      if (want && want !== 'google' && want !== 'github') {
-        await sendTelegramMessage(chatId, `I can connect: ${[google && 'google', github && 'github'].filter(Boolean).join(', ')}. Try /connect google or /connect github.`);
+      if (want && want !== 'google' && want !== 'github' && want !== 'model') {
+        await sendTelegramMessage(chatId, `I can connect: ${[google && 'google', github && 'github', aiModel && 'model'].filter(Boolean).join(', ')}. Try /connect google, /connect github or /connect model.`);
         return true;
       }
       const parts = [];
@@ -731,9 +1110,12 @@ async function handleCommand({ chatId, text, isAdmin }) {
         parts.push(`Google (Gmail + Calendar) — I can only save email drafts and read your calendar, and I never send email on my own. Google's screen words the Gmail permission as "manage drafts and send emails"; that is the narrowest it offers.\n${google.startSignIn(chatId)}`);
       }
       if (github && (!want || want === 'github')) {
-        parts.push(`GitHub — you choose exactly which projects I can see on the next screen; pick only the ones you want. For now I only look (open pull requests, build status) and change nothing, though GitHub's screen will say read and write.\n${github.startInstall(chatId)}`);
+        parts.push(`GitHub — you choose exactly which projects I can see on the next screen; pick only the ones you want. I can look (open pull requests, build status, code) and, only after you say yes in chat, put a change on a new branch as a pull request — never straight onto your main branch. GitHub's screen will say read and write.\n${github.startInstall(chatId)}`);
       }
-      if (!parts.length) { await sendTelegramMessage(chatId, `${want === 'github' ? 'GitHub' : 'Google'} isn't set up on this server yet.`); return true; }
+      if (aiModel && (!want || want === 'model')) {
+        parts.push(`AI model (optional, for coding tasks) — a private page opens where you pick a provider and type YOUR OWN API key into a hidden box. The key goes straight into my encrypted vault, never through this chat. When you run /code, the task and one file get sent to that provider, and you pay them. (No key needed if the shared AI is set up — see /model.)\n${aiModel.startSetup(chatId)}`);
+      }
+      if (!parts.length) { await sendTelegramMessage(chatId, `${want === 'github' ? 'GitHub' : want === 'model' ? 'The AI model connection' : 'Google'} isn't set up on this server yet.`); return true; }
       await sendTelegramMessage(chatId, `Tap to connect (links work for 10 minutes):\n\n${parts.join('\n\n')}`);
       return true;
     }
@@ -747,40 +1129,50 @@ async function handleCommand({ chatId, text, isAdmin }) {
       const lines = [];
       if (google) lines.push(g ? `Google: connected${g.email ? ` as ${g.email}` : ''} (Gmail drafts + Calendar)` : 'Google: not connected — /connect google');
       if (github) lines.push(h ? `GitHub: connected${h.label ? ` as ${h.label}` : ''} (the projects you picked — change them in GitHub → Settings → Applications)` : 'GitHub: not connected — /connect github');
-      lines.push('Disconnect with /disconnect google or /disconnect github.');
+      if (aiModel) {
+        const m = conns.find((c) => c.provider === 'model');
+        lines.push(m ? `AI model: your own key — ${m.label || 'connected'}` : 'AI model: no key of your own (optional) — /connect model');
+        const cur = aiModel.resolve(chatId, tenant.modelChoice);
+        const hp = aiModel.resolve(chatId, tenant.modelChoice, { helper: true });
+        lines.push(`For coding I use: ${cur ? cur.label : tenant.modelChoice === 'local' ? 'the local model only' : hp ? hp.label : 'the local model'} — change with /model`);
+      }
+      lines.push('Disconnect with /disconnect google, /disconnect github or /disconnect model.');
       await sendTelegramMessage(chatId, lines.join('\n'));
       return true;
     }
 
     case '/disconnect':
     case '/disconnect_google':
-    case '/disconnect_github': {
+    case '/disconnect_github':
+    case '/disconnect_model': {
       if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
-      const have = [google?.isConnected(chatId) && 'google', github?.isConnected(chatId) && 'github'].filter(Boolean);
+      const have = [google?.isConnected(chatId) && 'google', github?.isConnected(chatId) && 'github', aiModel?.hasOwn(chatId) && 'model'].filter(Boolean);
       if (!have.length) { await sendTelegramMessage(chatId, 'Nothing is connected right now.'); return true; }
 
-      let target = cmd === '/disconnect_google' ? 'google' : cmd === '/disconnect_github' ? 'github' : arg.toLowerCase();
+      let target = cmd === '/disconnect_google' ? 'google' : cmd === '/disconnect_github' ? 'github' : cmd === '/disconnect_model' ? 'model' : arg.toLowerCase();
       if (!target) {
         if (have.length === 1) {
           target = have[0];
         } else {
           const info = Object.fromEntries(vault.status(chatId).map((c) => [c.provider, c.email || c.label]));
-          const names = { google: 'Google', github: 'GitHub' };
+          const names = { google: 'Google', github: 'GitHub', model: 'AI model' };
           await sendTelegramMessage(chatId, `Which one do you want to disconnect? Tap one:\n${have.map((p) => `/disconnect_${p} — ${names[p]}${info[p] ? ` (${info[p]})` : ''}`).join('\n')}`);
           return true;
         }
       }
-      if (!['google', 'github'].includes(target)) {
+      if (!['google', 'github', 'model'].includes(target)) {
         await sendTelegramMessage(chatId, `I can disconnect: ${have.join(', ')}. Try /disconnect_${have[0]}.`);
         return true;
       }
       if (!have.includes(target)) {
-        await sendTelegramMessage(chatId, `${target === 'google' ? 'Google' : 'GitHub'} isn't connected.`);
+        await sendTelegramMessage(chatId, `${target === 'google' ? 'Google' : target === 'github' ? 'GitHub' : 'The AI model'} isn't connected.`);
         return true;
       }
       // Disconnecting changes things, so it asks first like everything else.
       pendingActions.set(String(chatId), { action: 'disconnect', args: { provider: target }, createdAt: Date.now() });
-      await sendTelegramMessage(chatId, target === 'google'
+      await sendTelegramMessage(chatId, target === 'model'
+        ? "Remove your own AI key? I'll delete it from my vault. /code will then use the shared AI if one is set up (see /model), otherwise the slower local model. You can add a key again any time with /connect model.\n\nGo ahead? (yes/no)"
+        : target === 'google'
         ? "Disconnect Google? I'll lose access to your Gmail drafts and calendar. You can reconnect any time with /connect google.\n\nGo ahead? (yes/no)"
         : "Disconnect GitHub? I'll remove the GitHub app from your account, so I won't see any projects. To use it again you'd install it and pick your projects again.\n\nGo ahead? (yes/no)");
       return true;
@@ -815,6 +1207,7 @@ async function handleCommand({ chatId, text, isAdmin }) {
       if (ok) {
         if (google) await google.disconnect(arg);
         if (github) await github.disconnect(arg);
+        if (aiModel) aiModel.disconnectOwn(arg);
         pendingActions.delete(String(arg));
         notesByTenant.delete(String(arg));
       }
@@ -854,7 +1247,14 @@ async function handleCommand({ chatId, text, isAdmin }) {
 // ---------------------------------------------------------------------------
 
 const pendingActions = new Map(); // chatId -> { action, args, createdAt }
-const PENDING_TIMEOUT_MS = 10 * 60 * 1000;
+const PENDING_TIMEOUT_MS = Number(process.env.PENDING_TIMEOUT_MS) || 10 * 60 * 1000; // (env override is for tests)
+// A push offer points at a saved file (re-checked by hash and by the file's version on GitHub at push time),
+// so it can safely wait longer than a quick yes/no like /disconnect.
+const PUSH_OFFER_TIMEOUT_MS = Number(process.env.PUSH_OFFER_TIMEOUT_MS) || 60 * 60 * 1000;
+const pendingTtl = (p) => (p.action === 'push_change' ? PUSH_OFFER_TIMEOUT_MS : PENDING_TIMEOUT_MS);
+// A bare "yes" is only trusted for a short while. After that, a push offer needs the person to say
+// "push it" — a word that can't be mistaken for the end of some other conversation.
+const isPushPhrase = (t) => /^(yes[, ]+|yeah[, ]+|ok(ay)?[, ]+|please[, ]+)?(go ahead( and)? )?push( it| this| that)?( please)?[.!]?$/i.test(t.trim());
 
 const strangerRepliedAt = new Map();
 const STRANGER_COOLDOWN_MS = 10 * 60 * 1000;
@@ -871,7 +1271,7 @@ async function handleStranger(chatId, message) {
 async function deliver(chatId, tenant, result) {
   await sendTelegramMessage(chatId, result.text);
   // Businesses can't open a folder on this computer, so send them the file.
-  if (result.file && !tenant.isAdmin) await sendTelegramDocument(chatId, result.file);
+  if (result.file && (!tenant.isAdmin || result.sendFile)) await sendTelegramDocument(chatId, result.file);
 }
 
 async function handleMessage(message) {
@@ -883,6 +1283,7 @@ async function handleMessage(message) {
 
   const isAdmin = Boolean(ADMIN_ID) && String(fromId) === ADMIN_ID;
 
+  if (text.startsWith('/')) pendingActions.delete(key); // anything else you send closes an open yes/no
   if (text.startsWith('/') && (await handleCommand({ chatId, text, isAdmin }))) return;
 
   const tenant = store.get(chatId);
@@ -891,8 +1292,15 @@ async function handleMessage(message) {
   try {
     // A yes/no for something we asked about earlier?
     const pending = pendingActions.get(key);
-    if (pending && Date.now() - pending.createdAt < PENDING_TIMEOUT_MS) {
-      if (isConfirmation(text)) {
+    if (pending && Date.now() - pending.createdAt < pendingTtl(pending)) {
+      const age = Date.now() - pending.createdAt;
+      const stalePush = pending.action === 'push_change' && age >= PENDING_TIMEOUT_MS;
+      if (stalePush && isConfirmation(text) && !isPushPhrase(text)) {
+        // An old offer and a bare "yes": don't act on it. Say what it was and ask for a clear go-ahead.
+        const pr = pending.args.proposal;
+        return await sendTelegramMessage(chatId, `That offer is ${Math.round(age / 60000)} minutes old, so I'm not taking a plain "${text.trim()}" as the go-ahead. It was: ${pr.isNew ? 'the new file' : `${pr.added} added line${pr.added === 1 ? '' : 's'}`} in ${pr.filePath} (${pr.repo}), as a pull request on a new branch.\n\nIf you do want it, reply "push it". Anything else cancels it.`);
+      }
+      if (isConfirmation(text) && !stalePush || (pending.action === 'push_change' && isPushPhrase(text))) {
         pendingActions.delete(key);
         return await deliver(chatId, tenant, await executeAction(tenant, pending.action, pending.args));
       }
@@ -903,13 +1311,22 @@ async function handleMessage(message) {
       pendingActions.delete(key); // something else entirely: drop it, treat as new
     } else if (pending) {
       pendingActions.delete(key); // expired
+      if (pending.action === 'push_change' && (isConfirmation(text) || isPushPhrase(text))) {
+        return await sendTelegramMessage(chatId, "That offer has expired (they last an hour), so I didn't push anything. Ask for the change again with /code and I'll redo it — or use the saved file in the folder I showed you.");
+      }
+    }
+
+    // "push it", "go ahead and commit"… typed as a normal message. Only a real offer can push, and a
+    // chat model must never pretend one is waiting — so this is answered here, not by the model.
+    if (PUSH_INTENT_RE.test(text)) {
+      return await sendTelegramMessage(chatId, "I can't push from a plain message, and nothing is waiting for a yes right now. I only push right after I show you a change (I ask \"Want me to push this?\"), or from /changes, where you pick a saved change to push.");
     }
 
     const parsed = await interpretCommand(tenant, text);
     const { action } = parsed;
     parsed.userText = text;
     // Small models sometimes write the word "null"/"none" instead of a real null.
-    for (const k of ['repo', 'when', 'recipient', 'filename', 'location']) {
+    for (const k of ['repo', 'when', 'recipient', 'filename', 'location', 'task']) {
       if (typeof parsed[k] === 'string' && /^(null|none|n\/a|undefined|nil|)$/i.test(parsed[k].trim())) parsed[k] = null;
     }
     parsed.sheet_rows = parsed.sheet_rows == null ? null : normalizeRows(parsed.sheet_rows);
@@ -1036,6 +1453,38 @@ app.get('/oauth/github/callback', async (req, res) => {
   }
 });
 
+// The private page where an API key is typed. The key goes from this form
+// straight into the encrypted vault — it never touches Telegram or the AI.
+const KEY_PAGE_HEADERS = { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' };
+
+app.get('/connect/model', (req, res) => {
+  res.set(KEY_PAGE_HEADERS);
+  if (!aiModel) return res.status(404).send(page('Not available', 'Connections are not set up on this server.'));
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  if (!aiModel.isValidSetup(state)) return res.status(400).send(page('Link expired', 'Go back to Telegram and send /connect model for a new link.'));
+  res.send(aiModel.formHtml(state));
+});
+
+app.post('/connect/model', express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
+  res.set(KEY_PAGE_HEADERS);
+  if (!aiModel) return res.status(404).send(page('Not available', 'Connections are not set up on this server.'));
+  const b = req.body || {};
+  const state = typeof b.state === 'string' ? b.state : '';
+  if (!aiModel.isValidSetup(state)) return res.status(400).send(page('Link expired', 'Go back to Telegram and send /connect model for a new link.'));
+  try {
+    const r = await aiModel.finishSetup(state, { provider: String(b.provider || ''), model: String(b.model || ''), key: String(b.key || ''), label: String(b.label || '') });
+    res.send(page('Saved ✓', 'Your key is saved (encrypted). You can close this tab and go back to Telegram.'));
+    await sendTelegramMessage(r.chatId, r.managed
+      ? `Model added for everyone: ${r.label} ✅ Businesses can now pick it with /model. I never saw the key — it went straight into the encrypted vault. See /models to manage the list.`
+      : `AI model connected: ${r.label} ✅ /code will use your key when you pick it (/model) — or by default if no shared AI is set up. I never saw your key — it went straight into the encrypted vault. Remove it any time with /disconnect model.`);
+  } catch (err) {
+    if (!err.userFacing) console.error('AI model setup failed:', err.name);
+    // Back to the form with a plain-language reason (never the key itself).
+    const retry = err.code === 'expired' || err.code === 'locked' ? null : aiModel.isValidSetup(state) ? state : null;
+    res.status(400).send(retry ? aiModel.formHtml(retry, err.userFacing ? err.message : 'Something went wrong. Try again.') : page('Not connected', err.userFacing ? err.message : 'Something went wrong. Send /connect model to try again.'));
+  }
+});
+
 app.post('/telegram-webhook', express.json(), (req, res) => {
   if (!secretOk(req)) return res.status(401).send();
   res.status(200).send(); // answer Telegram right away; do the work in the queue
@@ -1074,6 +1523,9 @@ async function setBotCommands() {
       body: JSON.stringify({ commands: [
         { command: 'help', description: 'What I can do' },
         { command: 'connect', description: 'Link Google or GitHub' },
+        { command: 'code', description: 'Make a code change (shown first, pushed only if you say yes)' },
+        { command: 'model', description: 'Choose the AI used for coding' },
+        { command: 'changes', description: 'See saved code changes and push one' },
         { command: 'connections', description: 'See what is linked' },
         { command: 'disconnect', description: 'Unlink an account' },
         { command: 'instructions', description: 'Tell me about your business' },
@@ -1086,5 +1538,5 @@ async function setBotCommands() {
 botUsername = await getBotUsername();
 await setBotCommands();
 app.listen(PORT, () => {
-  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
+  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
 });

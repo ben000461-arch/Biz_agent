@@ -4,7 +4,10 @@
 // password, no long-lived token. When we need to act, we sign a short-lived
 // proof with the app's private key and trade it for an hour-long token.
 //
-// This file only READS (repos, pull requests, build status).
+// Reading (repos, pull requests, build status, code) happens freely. The ONE
+// thing that writes is pushChange(): it puts a change on a NEW branch and opens
+// a pull request. It never touches the default branch, so nothing goes live
+// until a person merges it on GitHub. The bot only calls it after a "yes".
 
 import crypto from 'crypto';
 import fs from 'fs';
@@ -79,6 +82,21 @@ export function createGitHub({ appId, slug, clientId, clientSecret, privateKey, 
     }
     if (!res.ok) throw new Error(`GitHub API error ${res.status}`);
     return res.json();
+  }
+
+  // Like `call`, but for writes: hands back the response so the caller can tell
+  // a missing permission (403) from a conflict (409/422) instead of just failing.
+  async function send(chatId, method, path, body) {
+    const init = { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) };
+    let res = await gh(path, await installationToken(chatId), init);
+    if (res.status === 401) {
+      const rec = vault.get(chatId, 'github');
+      if (rec?.installationId) tokenCache.delete(String(rec.installationId));
+      res = await gh(path, await installationToken(chatId), init);
+      if (res.status === 401) throw new NeedsReconnect('token rejected');
+    }
+    const data = await res.json().catch(() => ({}));
+    return { status: res.status, ok: res.ok, data };
   }
 
   async function repos(chatId) {
@@ -161,6 +179,85 @@ export function createGitHub({ appId, slug, clientId, clientSecret, privateKey, 
     },
 
     repos,
+
+    // ---- Reading code (still read-only: nothing here changes a repository) ----
+
+    // The list of files in a project (default branch), so the coding step can
+    // pick the right one.
+    async repoTree(chatId, hint) {
+      const r = await resolveRepo(chatId, hint);
+      if (r.error) return { error: r.error };
+      if (!REPO_RE.test(r.repo)) return { error: "That repository name looks odd — I won't touch it." };
+      const data = await call(chatId, `/repos/${r.repo}/git/trees/HEAD?recursive=1`);
+      const files = (data.tree || [])
+        .filter((t) => t.type === 'blob')
+        .map((t) => ({ path: t.path, size: t.size || 0 }));
+      return { repo: r.repo, files, truncated: Boolean(data.truncated) };
+    },
+
+    // One file's text. Refuses anything that isn't a plain file or is large.
+    async readFile(chatId, repo, filePath, maxBytes = 100_000) {
+      if (!REPO_RE.test(repo)) return { error: "That repository name looks odd — I won't touch it." };
+      if (typeof filePath !== 'string' || !filePath || filePath.includes('..') || filePath.startsWith('/')) {
+        return { error: "That file path looks odd — I won't touch it." };
+      }
+      const enc = filePath.split('/').map(encodeURIComponent).join('/');
+      const data = await call(chatId, `/repos/${repo}/contents/${enc}`);
+      if (Array.isArray(data) || data.type !== 'file') return { error: `${filePath} isn't a plain file.` };
+      if (data.size > maxBytes) return { error: `${filePath} is too big for me to work on (${Math.round(data.size / 1024)} KB).` };
+      if (data.encoding !== 'base64' || typeof data.content !== 'string') return { error: `I couldn't read ${filePath}.` };
+      const text = Buffer.from(data.content, 'base64').toString('utf8');
+      if (text.includes('\u0000')) return { error: `${filePath} looks like a binary file, not code.` };
+      return { path: filePath, text, sha: data.sha };
+    },
+
+    // The only write. Branch + commit + pull request; the default branch is
+    // never written to. `baseSha` is the file's version when we read it — if
+    // someone changed the file on GitHub since, we stop rather than clobber it.
+    async pushChange(chatId, repo, { filePath, content, baseSha, title, body, branchHint }) {
+      if (!REPO_RE.test(repo)) return { error: "That repository name looks odd — I won't touch it." };
+      if (typeof filePath !== 'string' || !filePath || filePath.includes('..') || filePath.startsWith('/')) return { error: "That file path looks odd — I won't touch it." };
+      const enc = filePath.split('/').map(encodeURIComponent).join('/');
+      const noWrite = { error: "GitHub says my app isn't allowed to write to that project. In GitHub: Settings → Applications → Installed GitHub Apps → Biz Agent Bot → review the permissions and accept the update (Contents and Pull requests: read & write)." };
+
+      const info = await call(chatId, `/repos/${repo}`);
+      const base = info.default_branch;
+      if (!base) return { error: "I couldn't find the project's main branch." };
+      const ref = await call(chatId, `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`);
+      const headSha = ref?.object?.sha;
+      if (!headSha) return { error: "I couldn't read the project's latest commit." };
+
+      // Has the file changed on GitHub since we read it?
+      const cur = await send(chatId, 'GET', `/repos/${repo}/contents/${enc}?ref=${encodeURIComponent(base)}`);
+      if (cur.status === 200 && !Array.isArray(cur.data)) {
+        if (!baseSha) return { error: `${filePath} already exists on GitHub, so I won't overwrite it.` };
+        if (cur.data.sha !== baseSha) return { error: `${filePath} changed on GitHub after I read it, so I stopped to avoid overwriting someone's work. Ask me again and I'll start from the latest version.` };
+      } else if (cur.status !== 404) {
+        return { error: `GitHub wouldn't let me check ${filePath} (error ${cur.status}).` };
+      } else if (baseSha) {
+        return { error: `${filePath} was removed from GitHub after I read it, so I stopped.` };
+      }
+
+      const slug = String(branchHint || 'change').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'change';
+      const branch = `biz-agent/${slug}-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-')}`;
+      const mk = await send(chatId, 'POST', `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: headSha });
+      if (mk.status === 403 || mk.status === 404) return noWrite;
+      if (!mk.ok) return { error: `GitHub wouldn't create the branch (error ${mk.status}).` };
+
+      const put = await send(chatId, 'PUT', `/repos/${repo}/contents/${enc}`, {
+        message: String(title).slice(0, 200),
+        content: Buffer.from(content, 'utf8').toString('base64'),
+        branch,
+        ...(baseSha ? { sha: baseSha } : {}),
+      });
+      if (put.status === 403 || put.status === 404) return noWrite;
+      if (!put.ok) return { error: `GitHub wouldn't accept the change (error ${put.status}).`, branch };
+
+      const pr = await send(chatId, 'POST', `/repos/${repo}/pulls`, { title: String(title).slice(0, 200), head: branch, base, body: String(body || '').slice(0, 4000) });
+      if (pr.status === 403 || pr.status === 404) return { ...noWrite, branch };
+      if (!pr.ok) return { error: `I saved the change on a new branch (${branch}) but GitHub wouldn't open the pull request (error ${pr.status}).`, branch };
+      return { repo, branch, base, number: pr.data.number, url: pr.data.html_url };
+    },
 
     async openPulls(chatId, hint) {
       const r = await resolveRepo(chatId, hint);
