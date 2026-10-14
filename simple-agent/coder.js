@@ -12,6 +12,7 @@
 // text: the worst a booby-trapped file can do is make the saved result odd,
 // because the result only ever lands in a local folder.
 
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -277,19 +278,14 @@ export async function runCodeTask(deps, args) {
   const diffLines = diff ? diff.split('\n') : [];
   const added = target ? diffLines.filter((l) => l.startsWith('+') && !l.startsWith('+++')).length : code.split('\n').length - (code.endsWith('\n') ? 1 : 0);
   const removed = target ? diffLines.filter((l) => l.startsWith('-') && !l.startsWith('---')).length : 0;
-  const n = (k, word) => `${k} ${word}${k === 1 ? '' : 's'}`;
+  const counts = target ? `+${added}${removed ? ` −${removed}` : ''}` : `${added} line${added === 1 ? '' : 's'}`;
   const lines = [];
-  lines.push(target
-    ? `Done — in ${relPath} (${tree.repo}) I added ${n(added, 'line')}${removed ? ` and removed ${n(removed, 'line')}` : ''}.`
-    : `Done — I wrote a new file, ${relPath}, for ${tree.repo} (${n(added, 'line')}).`);
-  if (summary) lines.push(clip(summary, 400));
+  lines.push(target ? `Done — ${relPath} (${tree.repo}): ${counts}.` : `Done — new file ${relPath} for ${tree.repo} (${counts}).`);
+  if (summary) lines.push(clip(summary, 200));
   if (check) lines.push(check.ok ? `✅ ${check.label}` : `⚠️ ${check.label} — worth a look before using it.`);
-  if (diff) {
-    const shown = diff.split('\n').slice(0, 40).join('\n');
-    lines.push(`Changes:\n${clip(shown, 1400)}${diff.split('\n').length > 40 ? '\n…(more in the saved diff)' : ''}`);
-  }
-  if (!target) lines.push(`The file:\n${clip(code.split('\n').slice(0, 40).join('\n'), 1400)}`);
-  lines.push(`Saved to: ${deps.showPaths ? dir : 'your workspace'}\nNot pushed yet — your GitHub project is untouched.`);
+  // The code itself is in the attached file (and changes.diff next to it) — not repeated in the message.
+  const shownDir = deps.showPaths ? dir.replace(os.homedir(), '~') : null;
+  lines.push(shownDir ? `Saved in ${shownDir}. Nothing is on GitHub yet.` : 'Nothing is on GitHub yet.');
   const proposal = {
     repo: tree.repo,
     filePath: relPath,

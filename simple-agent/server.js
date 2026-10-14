@@ -182,11 +182,14 @@ function fixStrayUnicodeEscapes(text) {
   return text.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
-// Keep at most the first two sentences of a chat reply — the small model
-// doesn't always obey the length rule in the prompt.
+// Keep a chat reply short: at most two sentences. Abbreviations like "e.g." and times like "3:47 PM."
+// must not count as the end of a sentence.
 function trimChatReply(reply) {
-  const sentences = reply.replace(/\s+/g, ' ').trim().match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) || [reply];
-  return sentences.slice(0, 2).join('').trim();
+  const text = reply.replace(/\s+/g, ' ').trim()
+    .replace(/\b(e)\.(g)\./gi, '$1\u0001$2\u0001').replace(/\b(i)\.(e)\./gi, '$1\u0001$2\u0001')
+    .replace(/\b(etc|vs|approx|Mr|Mrs|Ms|Dr|St|No)\./g, '$1\u0001');
+  const parts = text.split(/(?<=[.!?])\s+(?=[A-Z"'(\/\d])/);
+  return parts.slice(0, 2).join(' ').replace(/\u0001/g, '.').slice(0, 450).trim();
 }
 
 // A safe filename: no folders, no odd characters, never "." or "..".
@@ -209,6 +212,27 @@ function normalizeRows(rows) {
 // Telegram
 // ---------------------------------------------------------------------------
 
+// ---- Short conversation memory (so a follow-up like "what did you just say?" makes sense) ----
+// In RAM only, per chat, last ~12 exchanges for 2 hours; links and anything key-like are scrubbed first,
+// slash commands are never stored, and a restart forgets it all. Only the chat model ever sees it.
+const MEMORY_TTL_MS = Number(process.env.MEMORY_TTL_MS) || 2 * 60 * 60 * 1000;
+const MEMORY_MAX_TURNS = 24;
+const chatMemory = new Map();
+function remember(chatId, role, text) {
+  const clean = String(text || '').replace(/https?:\/\/\S+/g, '[link]').replace(new RegExp(SECRET_RE.source, 'g'), '[removed]').replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (!clean) return;
+  const key = String(chatId);
+  const list = (chatMemory.get(key) || []).filter((m) => Date.now() - m.at < MEMORY_TTL_MS);
+  list.push({ role, content: clean, at: Date.now() });
+  chatMemory.set(key, list.slice(-MEMORY_MAX_TURNS));
+}
+function recall(chatId) {
+  const list = (chatMemory.get(String(chatId)) || []).filter((m) => Date.now() - m.at < MEMORY_TTL_MS);
+  // the chat model answers in JSON, so show its earlier turns the same way
+  const REFUSAL_RE = /^(no[,.]?\s+)?(i('m| am) (not (able|capable|sure)|unable)|i (can'?t|cannot|don'?t (have|know|remember|want)|haven'?t|made a mistake)|i'?d (rate|like to be able))/i;
+  return list.filter((m) => !(m.role === 'assistant' && REFUSAL_RE.test(m.content))).map((m) => (m.role === 'assistant' ? { role: 'assistant', content: JSON.stringify({ reply: m.content }) } : { role: 'user', content: m.content }));
+}
+
 async function sendTelegramMessage(chatId, text) {
   let clean = fixStrayUnicodeEscapes(String(text));
   if (clean.length > 4000) clean = `${clean.slice(0, 3990)}\n…(trimmed)`; // Telegram caps messages at 4096
@@ -218,6 +242,7 @@ async function sendTelegramMessage(chatId, text) {
     body: JSON.stringify({ chat_id: chatId, text: clean }),
   });
   if (!res.ok) console.error(`Telegram sendMessage failed: ${res.status} ${await res.text()}`);
+  else remember(chatId, 'assistant', clean);
 }
 
 async function sendTelegramDocument(chatId, filePath, caption) {
@@ -245,7 +270,7 @@ async function getBotUsername() {
 // Local model
 // ---------------------------------------------------------------------------
 
-async function callLocalModel(systemPrompt, userText, { model = OLLAMA_MODEL, timeoutMs = 90_000 } = {}) {
+async function callLocalModel(systemPrompt, userText, { model = OLLAMA_MODEL, timeoutMs = 90_000, history = [], temperature = 0 } = {}) {
   let res;
   try {
     res = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -256,11 +281,12 @@ async function callLocalModel(systemPrompt, userText, { model = OLLAMA_MODEL, ti
         model,
         messages: [
           { role: 'system', content: systemPrompt },
+          ...history,
           { role: 'user', content: userText },
         ],
         format: 'json',
         stream: false,
-        options: { temperature: 0 },
+        options: { temperature, num_ctx: 4096 },
       }),
     });
   } catch (err) {
@@ -603,7 +629,7 @@ async function codeTaskAction(tenant, { repo, task, fileHint }) {
     // a business says yes once first (the owner of the bot doesn't need to ask themselves).
     if (sel.kind === 'managed' && !tenant.isAdmin && !tenant.cloudOk) {
       pendingActions.set(String(tenant.chatId), { action: 'cloud_ok', args: { repo, task, fileHint }, createdAt: Date.now() });
-      return { text: `For coding I'd use ${sel.label}, a cloud AI from ${sel.providerLabel}. To do the job I send it your task and the one file I'm working on — nothing else.\n\nIs that OK? (yes/no)\n\nYou can switch any time with /model, including to the free local model (slower and more basic).` };
+      return { text: `For coding I'd use ${sel.label} (a cloud AI from ${sel.providerLabel}). It gets your task and the one file I'm working on — nothing else. Is that OK? (yes/no)` };
     }
     const slot = aiModel.reserveTask(tenant.chatId, sel);
     if (!slot.ok) {
@@ -616,8 +642,8 @@ async function codeTaskAction(tenant, { repo, task, fileHint }) {
     maxChars = 60_000;
   }
   await sendTelegramMessage(tenant.chatId, sel
-    ? `On it — using ${sel.label}. I'm sending it the task and the one file I'm working on. I'll show you the result first and won't touch GitHub unless you say yes.`
-    : "On it — reading the project and writing the change with the local model. This can take a few minutes on a small computer. I'll show you the result first and won't touch GitHub unless you say yes.");
+    ? `On it — using ${sel.label}. It gets your task and this one file.`
+    : "On it with the local model — this can take a few minutes.");
   // Slow computers can take several minutes — say so now and then, so it
   // doesn't look dead.
   let pings = 0;
@@ -643,11 +669,11 @@ async function codeTaskAction(tenant, { repo, task, fileHint }) {
     // exact saved file the person just saw (checked again by hash at push time).
     if (result.proposal && result.proposal.syntaxOk === false) {
       // A change that doesn't even parse is not something to push. Keep it as a saved file only.
-      result.text += "\n\nI'm not offering to push this one because the syntax check failed. It's saved so you can look at it, and nothing was sent to GitHub. Try the same /code again, or see /model to change which AI writes code.";
+      result.text += "\n\nNot offering to push: the syntax check failed. It's saved for you to look at; nothing went to GitHub. Try /code again, or see /model.";
     } else if (result.proposal) {
       const pr = result.proposal;
       pendingActions.set(String(tenant.chatId), { action: 'push_change', args: { proposal: pr }, createdAt: Date.now() });
-      result.text += `\n\nWant me to push this? Reply yes and I'll put ${pr.isNew ? 'the new file' : `these ${pr.added} added line${pr.added === 1 ? '' : 's'}`} on a NEW branch in ${pr.repo} and open a pull request — your main branch isn't touched until you merge it. Reply no to keep it only as a saved file. (This offer stays open for an hour — after 10 minutes I'll ask you to say "push it".)`;
+      result.text += `\n\nWant me to push this? Reply yes and I'll open a pull request on a NEW branch — main stays untouched until you merge. (no = keep it as a saved file)`;
     }
     return result;
   } catch (err) {
@@ -684,7 +710,7 @@ async function pushChangeAction(tenant, pr) {
     });
     if (r.error) return { text: `${r.error}${r.branch ? `\n(Branch ${r.branch} was created on GitHub.)` : ''}` };
     if (pr.dir) { try { fs.writeFileSync(path.join(pr.dir, 'pushed.txt'), `${r.url}\n`); } catch { /* cosmetic */ } }
-    return { text: `Pushed ✓ I opened pull request #${r.number} in ${r.repo} (branch ${r.branch}).\n${r.url}\nNothing is live until you merge it on GitHub.` };
+    return { text: `Pushed ✓ pull request #${r.number} opened:\n${r.url}\nNothing is live until you merge it.` };
   } catch (err) {
     if (err instanceof NeedsReconnect) return { text: 'The GitHub connection is gone (the app may have been uninstalled) — send /connect github to reconnect.' };
     throw err;
@@ -741,6 +767,67 @@ const ACTION_GROUP = {
   list_repos: 'github', list_prs: 'github', build_status: 'github', code_task: 'github',
 };
 
+// ---------------------------------------------------------------------------
+// Guardrails around the router. The small model proposes an action; CODE decides whether the person's
+// words actually support it. It never acts on a hunch, never invents who an email is to, and says
+// plainly what it can't do instead of doing something nearby.
+// ---------------------------------------------------------------------------
+const EVIDENCE = {
+  add: /\d/, multiply: /\d/,
+  weather: /\b(weather|temperature|forecast|rain|raining|snow|sunny|degrees|hot|cold|humid|wind)\b/i,
+  add_note: /\b(notes?|remember|remind|jot|write (it )?down|save)\b/i,
+  list_notes: /\bnotes?\b/i,
+  write_file: [/\b(files?|\.txt|text document|document)\b/i, /\b(make|create|save|write|put|store|new|generate|draft|build)\b/i],
+  draft_email: /\b(e-?mail|mail|draft)\b/i,
+  write_excel: [/\b(excel|spreadsheets?|sheets?|xlsx|table|inventory|expenses|budget|list)\b/i, /\b(make|create|build|start|set up|setup|new|generate|put together|give me|prepare)\b/i],
+  view_excel: [/\b(excel|spreadsheets?|sheets?|xlsx|inventory|expenses|budget|table|list)\b|\.xlsx/i, /\b(show|see|open|view|display|list|read|contents?|look|check|pull up|print|what'?s in|what is in|whats in|how many|how much|do i have)\b/i],
+  edit_excel: [/\b(excel|spreadsheets?|sheets?|xlsx|inventory|expenses|budget|table|list)\b|\.xlsx/i, /\b(add|update|change|edit|remove|delete|put|insert|set|fill|increase|decrease|rename|append|subtract|plus|minus|mark|record)\b/i],
+  list_events: /\b(calendar|schedule|meetings?|agenda|events?|appointments?|today|tomorrow|this week|next week)\b/i,
+  list_repos: /\b(repos?|repositor\w*|projects?)\b/i,
+  list_prs: /\b(pull requests?|prs?)\b/i,
+  build_status: /\b(builds?|tests?|ci|passing|failing|pipeline|actions|checks?)\b/i,
+  code_task: /\b(code|coding|fix|bug|bugs|function|add|change|update|edit|refactor|implement|write|crash\w*|error|errors|file|\w+\.(js|ts|py|json|html|css|md))\b/i,
+};
+const WRITE_ACTIONS = new Set(['draft_email', 'write_file', 'write_excel', 'edit_excel', 'add_note', 'code_task']);
+const DO_VERB_RE = /\b(draft|write|compose|create|make|add|save|build|set up|generate|update|change|fix|put|insert|remember|note)\b/i;
+const FOLLOWUP_RE = /\b(again|earlier|before|previous(ly)?|the one (from|you)|that one|repeat|you (said|told|just)|what you (said|just))\b|\bhow (do|does|can|would|should)\b.*\bworks?\b|^why\b/i; // talking about the conversation or a concept, not asking for a tool
+const QUESTION_RE = /^(who|what|which|when|where|why|whose|is|are|was|were|did|does|do (you|i|we|they|the|my|those|these)|has|have|had|any)\b|\?\s*$/i;
+
+// Things this assistant genuinely can't do — said plainly, once, with the nearest thing it can do.
+const LIMITS = [
+  { re: /\b(who|did|has|have|any|check|read|show|list|see|find|search|open|what'?s in|what is in|what are)\b.*\b(inbox|e-?mails?|mail|drafts?)\b|\b(inbox|unread)\b/i,
+    not: /\b(draft|write|compose|create|make|prepare)\b.*\b(an?|the)\s+e-?mail\b/i,
+    reply: "I can write email drafts (saved to your Gmail drafts — never sent), but I can't read your inbox or list your drafts. To make one, say: draft an email to John about Friday." },
+];
+function limitReply(text) {
+  for (const l of LIMITS) if (l.re.test(text) && !(l.not && l.not.test(text))) return l.reply;
+  return null;
+}
+
+// null = fine to go ahead; { reply } = say this instead; { chat: true } = just talk.
+function vetRoute(tenant, text, parsed) {
+  const action = parsed.action;
+  if (!action || action === 'chat') return null;
+  if (action === 'add' && !/\b(add|plus|sum|total|and|together)\b|\+/i.test(text)) return { chat: true }; // the router only knows add/multiply — it must not turn "minus" into "plus"
+  if (action === 'multiply' && !/\b(multiply|multiplied|times|product|x)\b|[*×]/i.test(text)) return { chat: true };
+  if ((action === 'add' || action === 'multiply') && ![parsed.a, parsed.b].every((n) => n != null && new RegExp(`(^|[^\\d.])${String(n).replace('.', '\\.')}([^\\d]|$)`).test(text))) return { chat: true }; // never calculate numbers they didn't type
+  const ev = EVIDENCE[action];
+  if (ev && ![].concat(ev).every((re) => re.test(text))) return { chat: true }; // nothing in their words points at this tool
+  if (QUESTION_RE.test(text.trim()) && WRITE_ACTIONS.has(action) && !DO_VERB_RE.test(text)) return { chat: true }; // a question is never a request to change something
+  if (action === 'draft_email') {
+    // The address must come from THEIR words — a model will happily make one up (john.doe@example.com).
+    const addr = /[\w.+-]+@[\w-]+(\.[\w-]+)+/.exec(text)?.[0];
+    const name = /\b(?:to|for)\s+(?!an?\b|the\b|my\b|me\b|about\b)([a-z][\w'-]*(?:\s+[A-Z][\w'-]*)?)/i.exec(text)?.[1];
+    const modelRec = String(parsed.recipient || '').trim();
+    const nameSaid = modelRec && !/@/.test(modelRec) && modelRec.split(/\s+/).some((w) => w.length >= 3 && text.toLowerCase().includes(w.toLowerCase()));
+    if (addr) parsed.recipient = addr;
+    else if (nameSaid) parsed.recipient = modelRec;
+    else if (name) parsed.recipient = name;
+    else return { reply: 'Who is the email to, and what is it about? For example: draft an email to John about Friday.' };
+  }
+  return null;
+}
+
 async function interpretCommand(tenant, text) {
   const context = tenant.isAdmin
     ? ''
@@ -780,24 +867,290 @@ Respond ONLY with valid JSON: {"action": "add"|"multiply"|"weather"|"add_note"|"
 
 // A separate, small prompt just for conversation. Splitting this from routing
 // keeps the router prompt short, which the 3B model needs to stay reliable.
+// What this assistant can really do for this person, in plain words — one source of truth that the
+// chat prompt and the "what can you do" answers both use, so they can never disagree or invent features.
+function capabilityList(tenant) {
+  const has = (g) => tenant.tools.includes(g);
+  const out = [];
+  if (has('email')) out.push('draft emails (saved to Gmail drafts, never sent)');
+  if (has('spreadsheets')) out.push('create, show and update spreadsheets');
+  if (has('files')) out.push('save text files');
+  if (has('calendar') && google) out.push('check your calendar');
+  if (has('utilities')) out.push('keep notes, do quick math, check the weather');
+  if (github?.isConnected(tenant.chatId) && has('github')) out.push('look at your GitHub projects and make code changes (shown first, pushed as a pull request only if you say yes)');
+  return out;
+}
+const repoCache = new Map();
+async function repoNames(tenant) {
+  if (!github?.isConnected(tenant.chatId) || !tenant.tools.includes('github')) return [];
+  const hit = repoCache.get(String(tenant.chatId));
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.names;
+  let names = [];
+  try { names = (await github.repos(tenant.chatId)).map((r) => r.full); } catch { /* offline: no names */ }
+  repoCache.set(String(tenant.chatId), { at: Date.now(), names });
+  return names;
+}
+function codingAiLabel(tenant) {
+  const sel = aiModel ? aiModel.resolve(tenant.chatId, tenant.modelChoice, { helper: true }) : null;
+  return sel ? `${sel.label} (a cloud AI, used only for code changes)` : `the same local model (${OLLAMA_MODEL})`;
+}
+
 async function chatReply(tenant, userText) {
-  const about = tenant.isAdmin
-    ? ''
-    : ` You work for a business called "${tenant.name}".${tenant.instructions ? ` Owner's notes: ${tenant.instructions}` : ''}`;
-  const systemPrompt = `You are a friendly, concise assistant that people text on their phone.${about}
-Reply in ONE short sentence (two at most, under 25 words), like a real person texting back. No lists, no paragraphs, no tutorials. When it fits, end with a short question.
-You can only do these things: draft emails, create and update spreadsheets, save text files, check their calendar${github?.isConnected(tenant.chatId) ? ', look at their GitHub projects (open pull requests, build status), and make small code changes (shown first, and pushed as a pull request only if they say yes)' : ''}. If asked for something else (browsing the internet, calling someone), say plainly you can't do that here and mention what you can help with.
-Never say you are pushing, sending, saving or waiting for a confirmation — a chat reply can't do any of that. If they ask to push code, tell them to send /changes.
-If they bring up coding or dev work, don't teach anything — tell them to send /code followed by what they want done, for example: /code in myapp, fix the crash in server.js.
+  const about = tenant.isAdmin ? '' : ` You work for a business called "${tenant.name}".${tenant.instructions ? ` Owner's notes: ${tenant.instructions}` : ''}`;
+  const caps = capabilityList(tenant);
+  const repos = await repoNames(tenant);
+  const systemPrompt = `You are a helpful, direct assistant that people text on their phone.${about}
+IN CHAT you can do anything a good conversational AI can do in plain text: answer questions, explain things, give advice, brainstorm, write short drafts, tell jokes, help with homework-style questions, and just talk. You can use emoji. Never say you can't do these. If you don't know something, say so in a full sentence and offer what you can do.
+FACTS about your tools and limits — the ONLY things you know about them. Never claim any other tool, integration or maker.
+- With the tools in this chat (used when they ask in plain words) you can: ${caps.length ? caps.join('; ') : 'chat only (no tools are switched on for this account)'}.
+- You can tell the time and date when asked (answered separately from the computer's clock).
+- You can NOT: browse the internet or look up news and current events (web search isn't built in yet), read an inbox, make calls, or send emails/messages to other people for them. Replying in this chat is fine.
+${repos.length ? `- Their GitHub projects: ${repos.slice(0, 6).join(', ')}. Code work: if they ask whether you can help with code, say yes — you can fix a bug, add a feature or edit a file in ${repos[0].split('/').pop()}, show the change first, and push only if they say yes — then ask what they need done. Don't show command syntax; they can just describe it.\n` : ''}ABOUT YOURSELF: don't mention what model or computer you run on, and don't talk about yourself unless asked. If asked about your wants, feelings, personality, or to rate yourself, answer briefly and lightly — you're an AI, so no real wants or feelings — and never invent limitations or abilities.
+HOW TO REPLY
+- Chat like a smart, honest friend. Answer from your own knowledge, accurately. If you're not sure, say "I'm not sure" — never guess or make things up (no invented times, news, numbers, or facts about yourself).
+- Be brief: one or two sentences, never more. No lists, no tutorials. No filler questions like "how can I help you today?"; ask a question only when you need the answer to help.
+- Use the conversation so far. When they refer to something said earlier, answer from it. Never claim you didn't say something you did, and never contradict yourself.
+- If they ask for something your tools do, tell them to just ask in plain words, with one example.
+- Never say you've sent, saved, pushed or are waiting for a confirmation — a chat reply can't do any of that. To push code they send /changes.
 Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
   try {
-    const out = await callLocalModel(systemPrompt, userText);
+    const history = recall(tenant.chatId);
+    if (history.length && history[history.length - 1].role === 'user') history.pop(); // the current message is sent separately
+    const out = await callLocalModel(systemPrompt, userText, { history, temperature: 0.5 });
     const r = typeof out?.reply === 'string' ? out.reply.trim() : '';
     return r ? trimChatReply(r) : null;
   } catch (err) {
     console.error('chatReply failed:', err.message);
     return null;
   }
+}
+
+// "ok", "got it", "haha", "nvm" need no answer — a model replying to them is where most of the odd
+// "let's start fresh" / feature-list replies came from. A thumbs-up reaction is enough; "thanks" gets a word.
+const THANKS_RE = /^(thanks|thank you|thx|ty|thank u|thanks a lot|thank you so much|thanks so much)$/;
+const ACK_RE = /^(ok|okay|k|kk|got it|gotcha|cool|nice|great|sure|alright|all right|fine|understood|i see|makes sense|good to know|interesting|intresting|interessting|wow|ha+h*a*h*|he(he)+|lol|lmao|nvm|nevermind|never mind|yup|yep|yeah|nope|nah|hmm+|ah|oh|oh ok|oh okay|oh i see)( thanks| thank you)?$/;
+async function reactToMessage(chatId, messageId, emoji) {
+  if (!messageId) return;
+  try {
+    await fetch(`${TG}/setMessageReaction`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] }) });
+  } catch { /* a reaction is a nicety, never an error */ }
+}
+
+// ---------------------------------------------------------------------------
+// Plain questions with a true answer the computer already knows (the time, what runs me, what I can
+// connect). Answered by code from real state — a 3B model would happily make these up.
+// ---------------------------------------------------------------------------
+const norm = (t) => t.toLowerCase().replace(/[^a-z0-9' ]/g, ' ').replace(/\s+/g, ' ').trim();
+// ---- Arithmetic is done by code, never guessed by a model ----
+function evalArithmetic(expr) { // + - * / ( ) and decimals only; returns a number or null
+  const toks = expr.match(/\d+(?:\.\d+)?|[()+\-*/]/g);
+  if (!toks || toks.join('').length !== expr.replace(/\s+/g, '').length) return null;
+  let i = 0;
+  const num = () => {
+    const t = toks[i++];
+    if (t === '(') { const v = sum(); if (toks[i++] !== ')') throw new Error('x'); return v; }
+    if (t === '-') return -num();
+    if (t === undefined || !/^\d/.test(t)) throw new Error('x');
+    return parseFloat(t);
+  };
+  const prod = () => { let v = num(); while (toks[i] === '*' || toks[i] === '/') { const op = toks[i++]; const r = num(); if (op === '/' && r === 0) throw new Error('div0'); v = op === '*' ? v * r : v / r; } return v; };
+  const sum = () => { let v = prod(); while (toks[i] === '+' || toks[i] === '-') { const op = toks[i++]; const r = prod(); v = op === '+' ? v + r : v - r; } return v; };
+  try { const v = sum(); return i === toks.length && Number.isFinite(v) ? v : null; } catch (e) { return e.message === 'div0' ? NaN : null; }
+}
+function mathReply(raw) {
+  let t = raw.toLowerCase().replace(/[,](?=\d{3}\b)/g, '').trim().replace(/[?!.=\s]+$/, '');
+  for (let i = 0; i < 4; i++) t = t.replace(/^(yes|yeah|yep|ok|okay|so|well|now|hey|and|but|then|just|please|can you|could you|tell me)[,\s]+/, '');
+  const cue = /^(what'?s|whats|what is|calculate|calc|compute|how much is|solve|evaluate)\s+/.exec(t);
+  if (cue) t = t.slice(cue[0].length);
+  const pct = /^(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)$/.exec(t);
+  if (pct) return `${pct[1]}% of ${pct[2]} = ${+(pct[1] * pct[2] / 100).toFixed(10)}`;
+  const wordy = /\b(plus|minus|times|multiplied by|divided by|over)\b/.test(t);
+  t = t.replace(/\bplus\b/g, '+').replace(/\bminus\b/g, '-').replace(/\b(times|multiplied by)\b/g, '*').replace(/\b(divided by|over)\b/g, '/').replace(/[×]/g, '*').replace(/[÷]/g, '/').replace(/(\d)\s*x\s*(\d)/g, '$1*$2');
+  if (!/^[\d\s.+\-*/()]+$/.test(t) || !/\d\s*[+\-*/]\s*[(\d-]/.test(t) || t.length > 60) return null;
+  // "1-10" or "5-7" on their own are ranges or scores, not subtraction — a minus needs a cue, words or spaces
+  if (!cue && !wordy && !/[+*/]/.test(t) && !/\s-\s/.test(t)) return null;
+  const v = evalArithmetic(t);
+  if (v === null) return null;
+  if (Number.isNaN(v)) return "I can't divide by zero.";
+  const shown = t.replace(/\s+/g, ' ').replace(/\*/g, ' x ').replace(/([+\-/])/g, ' $1 ').replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/ \)/g, ')').trim();
+  return `${shown} = ${+v.toFixed(10)}`;
+}
+
+function factReply(tenant, raw) {
+  const calc = mathReply(raw);
+  if (calc) return calc;
+  let t = norm(raw);
+  for (let i = 0; i < 4; i++) t = t.replace(/^(hey|hi|hello|ok|okay|so|um|umm|well|please|can you|could you|would you|do you know|do you|tell me|just|and|but|now|then)\s+/, '');
+  t = t.replace(/\s+(please|now|right now|for me)$/, '');
+  if (!t || t.split(' ').length > 9) return null;
+  if (/^(what'?s?( is)? )?(the )?(current )?(time|date|day)( is it| it is| today| now| right now)?$|^what (time|day|date) is it( now| right now| today)?$|^what is today'?s date$|^what'?s today$|^what day is today$/.test(t)) {
+    const now = new Date();
+    return `It's ${now.toLocaleString('en-US', { weekday: 'long', hour: 'numeric', minute: '2-digit' })}, ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} — by the clock on the computer I run on.`;
+  }
+  if (/^(what|which) (llm|model|ai|language model|brain|engine)\b.*\b(you|run|runs|power|powers|host|hosts|use|uses|are)\b|^(what|who) (runs|powers|hosts) you$|^what are you$|^who are you$|^what'?s? (is )?your name$|^are you (chatgpt|gpt|claude|gemini|llama|an? (ai|bot|robot|llm))$/.test(t)) {
+    if (!tenant.isAdmin) return `I'm an AI assistant set up for ${tenant.name}.`;
+    return `I'm your assistant here in Telegram. I run on a small AI model (${OLLAMA_MODEL}) on the computer that hosts me — not ChatGPT or Claude. For code changes I hand off to ${codingAiLabel(tenant)}.`;
+  }
+  if (/^how do you work$|^how does (this|the) (bot|assistant)( thing)? work$/.test(t)) {
+    return 'You text me in plain words. I work out what you want and use the real tool for it — spreadsheets, files, email drafts, GitHub. Anything that changes something, I show you first and wait for your yes.';
+  }
+  if (/^what (can|do) you (do|help with|offer|work with|use)$|^what (dev )?(tools|features|abilities|skills) (do you|can you)( have| use| work with)?$|^what are you (able|good) (to|at)( do)?$|^what do you work with$/.test(t)) {
+    const caps = capabilityList(tenant);
+    return caps.length ? `With the tools in this chat I can ${caps.join('; ')}. Just ask in plain words.` : 'No tools are switched on for your account yet — ask the person who set you up.';
+  }
+  if (/^what( other)? (tools|apps|services|accounts|things|integrations|stuff|else)\b.*\b(connect|link|integrate|hook up|plug in)\b|^what can i (connect|link)\b|^(which|what) (accounts|apps|services) can i (connect|link)$|^what (other )?(tools|apps) can i (connect|link|add)$/.test(t)) {
+    const items = [];
+    if (github && tenant.tools.includes('github')) items.push(`GitHub ${github.isConnected(tenant.chatId) ? '✓ linked' : '— /connect github'}`);
+    if (google && (tenant.tools.includes('calendar') || tenant.tools.includes('email'))) items.push(`Google (calendar and Gmail drafts) ${google.isConnected(tenant.chatId) ? '✓ linked' : '— /connect google'}`);
+    if (aiModel) items.push(`your own AI key for coding ${aiModel.hasOwn(tenant.chatId) ? '✓ linked' : '— /connect model'}`);
+    return items.length ? `You can link:\n${items.map((i) => `• ${i}`).join('\n')}\nThat's all for now.` : 'Nothing can be linked on your account yet.';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// The helper: "I'm lost" / "I need help with my code" — checks where this person actually is, then
+// answers in one or two sentences with ONE next step. Entirely code-driven (no model wording, so no
+// rambling and no invented features); it only looks, it never changes anything.
+// ---------------------------------------------------------------------------
+const TOPICS = {
+  push: /\b(push|pushed|pushing|pull request|pr|merge|commit|branch)\b/i,
+  connect: /\b(connect|link|linked|login|log in|sign in|github|google|calendar|connection|connections)\b/i,
+  model: /\b(model|ai|groq|intel|key|api)\b/i,
+  code: /\b(code|coding|repo|repos|repository|project|bug|bugs|error|errors|crash|crashes|crashing|broken|fix|app|server|build|builds|deploy)\b/i,
+  sheet: /\b(spreadsheet|spreadsheets|excel|sheet|inventory|expenses)\b/i,
+  email: /\b(email|emails|mail|draft)\b/i,
+  file: /\b(file|files|text file|txt)\b/i,
+  notes: /\b(note|notes|remind|reminder|reminders)\b/i,
+  calendar: /\b(calendar|schedule|meeting|meetings|agenda|appointment|appointments)\b/i,
+};
+const NEXT_RE = /\b(what|where|how)\b.*\b(next|do now|start|begin|first)\b/i;
+const HELP_LEAD_RE = /^(i |we )?(really |just )?(need|want|require)s? (some |a bit of |a little )?help\b|^(can|could|would) (you|u) (please )?help\b|^help( me| us)?\b|^i('?m| am) (so |really |a bit |kinda )?(lost|confused|stuck|not sure)\b|^im (lost|confused|stuck)\b|^(i )?(don'?t|do not) (know|understand|get) (what|how|where|this)\b|^what('?s)?\s*(should|do|can)\s*i\b|^how (do|does|can|should|would) (i|this|it|you|we)\b|^what (is|does) (this|that)\b/i;
+function editsWithinOne(a, b) { // true when a and b differ by at most one insert, delete, swap or substitution
+  if (a === b) return true;
+  if (a.length === b.length) {
+    const d = [...a].map((c, i) => (c === b[i] ? -1 : i)).filter((i) => i >= 0);
+    return d.length === 1 || (d.length === 2 && d[1] === d[0] + 1 && a[d[0]] === b[d[1]] && a[d[1]] === b[d[0]]);
+  }
+  const [x, y] = a.length < b.length ? [a, b] : [b, a];
+  let i = 0; while (i < x.length && x[i] === y[i]) i++;
+  return x.slice(i) === y.slice(i + 1);
+}
+const topicOf = (t) => Object.keys(TOPICS).find((k) => TOPICS[k].test(t)) || null;
+function isHelpIntent(raw) {
+  const t = raw.trim().replace(/[.!?]+$/, '');
+  if (!t || t.split(/\s+/).length > 14) return false;
+  const topic = topicOf(t);
+  if (/^(please )?(i )?(need |want )?(some |a bit of )?help( me| us)?( please)?$/i.test(t)) return true; // just "help"
+  if (/^i('?m| am)? ?(so |really |a bit |kinda )?(lost|confused|stuck|not sure)\b|^im (lost|confused|stuck)/i.test(t)) return true;
+  if (/^what('?s)?\s*(now|next|should i do|do i do|can i do)\b/i.test(t) || (t.split(/\s+/).length <= 8 && /^what\b/i.test(t) && NEXT_RE.test(t))) return true;
+  if (/^where (do|should) i (start|begin)/i.test(t)) return true;
+  if (/^(how does this work|how do i use (this|it)|what can you do|what do you do)$/i.test(t)) return true;
+  // "I need help making an email", "help on excel", "you wnat to help me code": asking for help with a tool, naming nothing specific.
+  if (topic && (HELP_LEAD_RE.test(t) || /\bhelp\b/i.test(t))) {
+    const FILLER = 'ok okay so well um umm hey hi yeah but just then also i we need want wanna gonna help helping with on in at for making make build building writing write doing do can could would will should you your please some a an and the my our me us to how does it this that use using get getting started start learn about work works is are'.split(' ');
+    const TOPIC_WORDS = 'text txt document documents email emails mail excel spreadsheet spreadsheets sheet sheets file files note notes calendar schedule meeting meetings reminder reminders code coding app project repo github google'.split(' ');
+    const known = new Set([...FILLER, ...TOPIC_WORDS]);
+    const near = (w) => w.length >= 4 && [...known].some((k) => Math.abs(k.length - w.length) <= 1 && editsWithinOne(w, k)); // typos: "wnat", "emial"
+    const left = t.toLowerCase().replace(/[^a-z0-9' ]/g, ' ').split(/\s+/).filter((w) => w && !known.has(w) && !near(w));
+    if (!left.length) return true;
+  }
+  // "help with my code", "how do I push a change", "how does my code work" — only for things this bot knows about
+  if (HELP_LEAD_RE.test(t) && ['code', 'push', 'connect', 'model'].includes(topic)) return true;
+  if (/^(how|why|what)\b.*\b(my|our) (code|app|project|repo|server)\b/i.test(t)) return true;
+  return false;
+}
+
+// Keys/tokens must never be pasted in a chat (it keeps a copy) — and must never reach a model.
+const SECRET_RE = /\b(gsk_[A-Za-z0-9]{20,}|sk-(ant-|or-|proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|\d{8,10}:[A-Za-z0-9_-]{35})\b|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+const SECRET_MSG = "That looks like a password or a secret key — please don't send those in chat. Delete that message (tap it → Delete for everyone), and if it's a real key, replace it in the service's dashboard. I didn't read or use it. To add an AI key safely, use /connect model — it opens a private page.";
+
+function helperState(tenant) {
+  const chatId = tenant.chatId;
+  const has = (g) => tenant.tools.includes(g);
+  const p = pendingActions.get(String(chatId));
+  const pending = p && Date.now() - p.createdAt < pendingTtl(p) ? p : null;
+  const sel = aiModel ? aiModel.resolve(chatId, tenant.modelChoice, { helper: true }) : null;
+  let saved = [];
+  try { saved = savedChanges(tenant, 20); } catch { /* none */ }
+  const unpushed = saved.filter((c) => !c.pushedUrl && c.proposal.syntaxOk !== false);
+  const failed = saved[0] && saved[0].proposal.syntaxOk === false && !saved[0].pushedUrl ? saved[0] : null; // the most recent run, if it failed its check
+  return {
+    githubOn: Boolean(github && has('github')),
+    githubConnected: Boolean(github?.isConnected(chatId)),
+    googleOn: Boolean(google && (has('calendar') || has('email'))),
+    googleConnected: Boolean(google?.isConnected(chatId)),
+    codingAi: sel ? sel.label : 'the local model',
+    unpushed: unpushed.length,
+    failed,
+    pending: pending ? { push: pending.action === 'push_change', stale: Date.now() - pending.createdAt >= PENDING_TIMEOUT_MS } : null,
+    hasEmail: has('email'), hasSheets: has('spreadsheets'), hasFiles: has('files'),
+  };
+}
+
+// Looks at GitHub itself (read-only) so the answer is about THEIR code, not a generic list.
+async function helperCodeCheck(tenant, s) {
+  const out = { repos: [], build: null };
+  try {
+    out.repos = (await github.repos(tenant.chatId)).map((r) => r.full);
+    if (out.repos.length === 1) {
+      const b = await github.buildStatus(tenant.chatId, out.repos[0]);
+      const run = b && !b.error ? b.runs?.[0] : null;
+      if (run && run.status === 'completed') out.build = run.conclusion === 'success' ? 'passing' : run.conclusion === 'failure' ? 'failing' : null;
+    }
+  } catch { /* GitHub unreachable — the answer just won't mention it */ }
+  return out;
+}
+
+const pushStep = (s) => (s.pending?.push
+  ? (s.pending.stale ? 'I showed you a change a while ago — reply "push it" to open the pull request, or anything else to cancel.' : 'I\'m waiting on you: reply yes to open the pull request for the change I showed you, or no to keep it as a file.')
+  : s.pending ? 'Reply yes or no to my last question first.' : null);
+
+async function helperReply(tenant, question) {
+  const s = helperState(tenant);
+  const q = (question || '').trim().replace(/[.!?]+$/, '');
+  const topic = topicOf(q);
+  const waiting = pushStep(s);
+
+  if (topic === 'push' || /\bpush\b/i.test(q)) {
+    if (waiting) return waiting;
+    if (!s.githubConnected) return 'Link your code first: send /connect github.';
+    return s.unpushed
+      ? `You have ${s.unpushed} saved change${s.unpushed === 1 ? '' : 's'} not pushed. Send /changes and pick one — I'll ask before I push it.`
+      : 'Nothing to push yet. Make a change with /code in <project>, <what to change> — I show it, then ask "push this?" and open a pull request only if you say yes.';
+  }
+  if (topic === 'connect') {
+    if (/google|calendar|email/i.test(q)) return s.googleConnected ? 'Google is already linked ✓ (/connections shows it).' : s.googleOn ? 'Send /connect google and approve it on the page that opens.' : "Google isn't switched on for your account.";
+    if (/github|code/i.test(q) || !s.googleOn) return s.githubConnected ? 'GitHub is already linked ✓ — try /code in <project>, <what to change>.' : s.githubOn ? 'Send /connect github and approve it on GitHub — about a minute.' : "GitHub isn't switched on for your account.";
+    return `Send /connect to link ${[s.githubOn && !s.githubConnected && 'GitHub', s.googleOn && !s.googleConnected && 'Google'].filter(Boolean).join(' and ') || 'an account'}; /connections shows what's linked.`;
+  }
+  if (topic === 'model') return `Coding is done by ${s.codingAi}. /model lets you pick another. Never paste a key in chat — /connect model opens a private page.`;
+  if (topic === 'calendar') return !s.googleOn ? "Calendar isn't switched on for your account." : s.googleConnected ? 'Ask like "what\'s on my calendar today?" or "…tomorrow?".' : 'Send /connect google first, then ask "what\'s on my calendar today?".';
+  if (topic === 'notes') return 'Say "add a note: call the vet" to save one, or "show my notes" to see them.';
+  if (topic === 'file') return s.hasFiles ? 'Say what to put in it: "make a file called todo.txt that says pick up milk". I show it to you before saving.' : "Text files aren't switched on for your account.";
+  if (topic === 'sheet') return s.hasSheets ? 'What is it for? Say it like: "make a spreadsheet of my expenses", "show my inventory" or "add oranges to inventory". I show you before changing a file.' : "Spreadsheets aren't switched on for your account.";
+  if (topic === 'email') return s.hasEmail ? (s.googleOn && !s.googleConnected ? 'Send /connect google first. Then say who it\'s to and what about: "draft an email to John about Friday". It goes to your drafts — never sent.' : 'Who is it to, and what about? Say it like: "draft an email to John about Friday". It goes to your Gmail drafts — never sent.') : "Email isn't switched on for your account.";
+
+  if (topic === 'code') {
+    if (waiting) return waiting;
+    if (!s.githubOn) return "Code isn't switched on for your account.";
+    if (!s.githubConnected) return "I can't see your code yet — send /connect github (about a minute) and I'll take it from there.";
+    if (s.failed) return `My last change to ${s.failed.proposal.filePath} failed its check, so I didn't offer to push it. Tell me again what to fix: /code in ${s.failed.proposal.repo.split('/').pop()}, <what to change>.`;
+    if (s.unpushed) return `You have ${s.unpushed} saved change${s.unpushed === 1 ? '' : 's'} not pushed — send /changes to push one. Or tell me what else to fix with /code.`;
+    const c = await helperCodeCheck(tenant, s);
+    const where = c.repos.length === 1 ? c.repos[0].split('/').pop() : c.repos.length ? 'your GitHub projects' : null;
+    if (/\b(how does|explain|what does)\b/i.test(q)) return `I can fix and change code, but I can't walk you through it yet.${where ? ` What would you like changed in ${where}?` : ''}`;
+    if (!c.repos.length) return 'GitHub is linked but I can see no projects — in GitHub, open Settings → Applications → Configure and pick a repository.';
+    const buildNote = c.build === 'failing' ? ` Your latest build is failing, which may be the problem.` : '';
+    return `Yes — I can fix a bug, add a feature or edit a file in ${where}. I show you the change first and only push it if you say yes.${buildNote} What do you need done?`;
+  }
+
+  // vague ("I'm lost", "what now", "help"): where you are + the single most useful next step
+  if (waiting) return waiting;
+  if (s.githubOn && !s.githubConnected) return 'To work on code, start with /connect github. Or just tell me what you need in plain words.';
+  if (s.unpushed) return `You have ${s.unpushed} saved change${s.unpushed === 1 ? '' : 's'} not pushed — send /changes to look at ${s.unpushed === 1 ? 'it' : 'them'}.`;
+  if (s.githubConnected) return 'Tell me what you need — for code: /code in <project>, <what to change>. Otherwise just ask in plain words, like "draft an email to John".';
+  return s.hasEmail ? 'Just tell me what you need, like "draft an email to John about Friday".' : 'Just tell me what you need in plain words.';
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +1210,7 @@ async function executeAction(tenant, action, args) {
   const chatted = await chatReply(tenant, args.userText || '');
   if (chatted) return { text: chatted };
 
-  return { text: `Not sure I caught that — could you say it a different way? I can help with things like drafting an email, creating or updating a spreadsheet, or saving a text file.` };
+  return { text: "Not sure I caught that — what are you trying to do?" };
 }
 
 // Actions that write to disk / could overwrite real data ask first.
@@ -973,7 +1326,7 @@ async function handleCommand({ chatId, text, isAdmin }) {
     if (!c || !/^[\w.-]+\/[\w.-]+$/.test(String(p.repo)) || !p.filePath || /(^|\/)\.\.(\/|$)|^\//.test(String(p.filePath))) { await sendTelegramMessage(chatId, "I can't find that saved change. Send /changes to see the recent ones."); return true; }
     if (p.syntaxOk === false) { await sendTelegramMessage(chatId, "That one failed the syntax check, so I won't push it. Run the /code again to get a fresh version."); return true; }
     pendingActions.set(String(chatId), { action: 'push_change', args: { proposal: p }, createdAt: Date.now() });
-    await sendTelegramMessage(chatId, `Push this change?\n\n${changeLine(c)}\n"${p.task}"\n\nI'd put it on a NEW branch in ${p.repo} and open a pull request — your main branch isn't touched until you merge it.${c.pushedUrl ? '\n(It was already pushed once — this would open another pull request.)' : ''}\n\nReply yes to push. Anything else cancels.`);
+    await sendTelegramMessage(chatId, `Push this change?\n${changeLine(c)}\n"${p.task}"\n\nNEW branch + pull request; main stays untouched.${c.pushedUrl ? ' (Already pushed once — this opens another.)' : ''} Reply yes to push.`);
     return true;
   }
 
@@ -1072,7 +1425,9 @@ async function handleCommand({ chatId, text, isAdmin }) {
     }
 
     case '/help': {
-      await sendTelegramMessage(chatId, tenant ? helpText(tenant) : INVITE_ONLY_MSG);
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      if (arg) { await sendTelegramMessage(chatId, await helperReply(tenant, arg)); return true; }
+      await sendTelegramMessage(chatId, `${helpText(tenant)}\n\nLost? Send /help what should I do next`);
       return true;
     }
 
@@ -1278,17 +1633,21 @@ async function handleMessage(message) {
   const chatId = message.chat.id;
   const key = String(chatId);
   const fromId = message.from?.id;
-  const text = (message.text || '').trim();
+  const text = (message.text || '').replace(/[\u2018\u2019\u02BC]/g, "'").replace(/[\u201C\u201D]/g, '"').trim(); // phones type curly quotes
   if (!text) return;
 
   const isAdmin = Boolean(ADMIN_ID) && String(fromId) === ADMIN_ID;
 
-  if (text.startsWith('/')) pendingActions.delete(key); // anything else you send closes an open yes/no
+  // A message with a secret in it is never read by a model or acted on.
+  if (store.get(chatId) && SECRET_RE.test(text)) return sendTelegramMessage(chatId, SECRET_MSG);
+  // anything else you send closes an open yes/no — except asking for help, which must not lose it
+  if (text.startsWith('/') && !/^\/help(@\w+)?(\s|$)/i.test(text)) pendingActions.delete(key);
   if (text.startsWith('/') && (await handleCommand({ chatId, text, isAdmin }))) return;
 
   const tenant = store.get(chatId);
   if (!tenant) return handleStranger(chatId, message);
 
+  if (!text.startsWith('/')) remember(chatId, 'user', text);
   try {
     // A yes/no for something we asked about earlier?
     const pending = pendingActions.get(key);
@@ -1308,6 +1667,9 @@ async function handleMessage(message) {
         pendingActions.delete(key);
         return await sendTelegramMessage(chatId, 'No problem, scrapped that — nothing was changed.');
       }
+      const fact = factReply(tenant, text);
+      if (fact) return await sendTelegramMessage(chatId, fact); // keep the offer open
+      if (isHelpIntent(text)) return await sendTelegramMessage(chatId, await helperReply(tenant, text)); // keep the offer open
       pendingActions.delete(key); // something else entirely: drop it, treat as new
     } else if (pending) {
       pendingActions.delete(key); // expired
@@ -1322,14 +1684,28 @@ async function handleMessage(message) {
       return await sendTelegramMessage(chatId, "I can't push from a plain message, and nothing is waiting for a yes right now. I only push right after I show you a change (I ask \"Want me to push this?\"), or from /changes, where you pick a saved change to push.");
     }
 
-    const parsed = await interpretCommand(tenant, text);
-    const { action } = parsed;
+    const plain = norm(text);
+    if (THANKS_RE.test(plain)) return await sendTelegramMessage(chatId, 'Anytime.');
+    if (ACK_RE.test(plain)) return await reactToMessage(chatId, message.message_id, '👍');
+    const fact = factReply(tenant, text);
+    if (fact) return await sendTelegramMessage(chatId, fact);
+    if (isHelpIntent(text)) return await sendTelegramMessage(chatId, await helperReply(tenant, text));
+    const limit = limitReply(text);
+    if (limit) return await sendTelegramMessage(chatId, limit);
+
+    const parsed = FOLLOWUP_RE.test(text) && !DO_VERB_RE.test(text) ? { action: 'chat' } : await interpretCommand(tenant, text);
+    let { action } = parsed;
     parsed.userText = text;
     // Small models sometimes write the word "null"/"none" instead of a real null.
     for (const k of ['repo', 'when', 'recipient', 'filename', 'location', 'task']) {
       if (typeof parsed[k] === 'string' && /^(null|none|n\/a|undefined|nil|)$/i.test(parsed[k].trim())) parsed[k] = null;
     }
     parsed.sheet_rows = parsed.sheet_rows == null ? null : normalizeRows(parsed.sheet_rows);
+
+    // Does what they actually wrote support what the model picked? If not, don't act on a hunch.
+    const veto = vetRoute(tenant, text, parsed);
+    if (veto?.reply) return await sendTelegramMessage(chatId, veto.reply);
+    if (veto?.chat) { parsed.action = 'chat'; action = 'chat'; }
 
     // Is this tool switched on for this business?
     const group = ACTION_GROUP[action];
