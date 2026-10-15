@@ -34,6 +34,7 @@ import { createGoogle, NeedsReconnect } from './google.js';
 import { createGitHub, readPrivateKey } from './github.js';
 import { runCodeTask, parseCodeRequest } from './coder.js';
 import { createModelConnector, extractJson, PROVIDERS } from './models.js';
+import { createLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -65,6 +66,7 @@ const {
   GITHUB_CLIENT_ID,
   GITHUB_CLIENT_SECRET,
   GITHUB_APP_PRIVATE_KEY_PATH,
+  SUPABASE_URL, SUPABASE_SERVICE_KEY, // optional: where the action log is written (see logger.js)
   GOOGLE_AUTH_BASE, GOOGLE_TOKEN_URL, GOOGLE_REVOKE_URL, GMAIL_API_BASE, CALENDAR_API_BASE, GITHUB_API_BASE, GITHUB_WEB_BASE, // test overrides
 } = process.env;
 
@@ -78,6 +80,28 @@ const ADMIN_ID = (ADMIN_TELEGRAM_ID || '').trim();
 
 const store = createStore(TENANTS_FILE || path.join(__dirname, 'data', 'tenants.json'));
 const workspacesRoot = WORKSPACES_DIR || path.join(__dirname, 'workspaces');
+
+// Action log: what the agent did (never what anyone said). Off unless both Supabase settings are present.
+const actionLog = createLogger({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+function logEvent(tenant, row) {
+  if (!tenant) return;
+  actionLog.log({ chat_id: String(tenant.chatId), business: tenant.name, ...row });
+}
+// The only free-text we log: a repo or file name the agent worked on, never content.
+const detailOf = (args) => args?.repo || args?.filename || args?.proposal?.repo || undefined;
+// Runs an action, times it and logs it. Errors are logged as failed, then rethrown for the normal handler.
+async function runAction(tenant, action, args) {
+  const t0 = Date.now();
+  try {
+    const result = await executeAction(tenant, action, args);
+    logEvent(tenant, { kind: action === 'chat' ? 'chat' : 'action', action, status: 'done', detail: detailOf(args), ms: Date.now() - t0 });
+    return result;
+  } catch (err) {
+    logEvent(tenant, { kind: 'error', action, status: 'failed', detail: err?.name || 'Error', ms: Date.now() - t0 });
+    if (err && typeof err === 'object') err.logged = true;
+    throw err;
+  }
+}
 
 if (ADMIN_ID) {
   store.ensure(ADMIN_ID, { name: 'Admin', isAdmin: true });
@@ -1642,7 +1666,10 @@ async function handleMessage(message) {
   if (store.get(chatId) && SECRET_RE.test(text)) return sendTelegramMessage(chatId, SECRET_MSG);
   // anything else you send closes an open yes/no — except asking for help, which must not lose it
   if (text.startsWith('/') && !/^\/help(@\w+)?(\s|$)/i.test(text)) pendingActions.delete(key);
-  if (text.startsWith('/') && (await handleCommand({ chatId, text, isAdmin }))) return;
+  if (text.startsWith('/') && (await handleCommand({ chatId, text, isAdmin }))) {
+    logEvent(store.get(chatId), { kind: 'command', action: text.split(/[\s@]/)[0], status: 'done' }); // the command word only, never what follows it
+    return;
+  }
 
   const tenant = store.get(chatId);
   if (!tenant) return handleStranger(chatId, message);
@@ -1661,15 +1688,16 @@ async function handleMessage(message) {
       }
       if (isConfirmation(text) && !stalePush || (pending.action === 'push_change' && isPushPhrase(text))) {
         pendingActions.delete(key);
-        return await deliver(chatId, tenant, await executeAction(tenant, pending.action, pending.args));
+        return await deliver(chatId, tenant, await runAction(tenant, pending.action, pending.args));
       }
       if (isCancellation(text)) {
         pendingActions.delete(key);
+        logEvent(tenant, { kind: 'action', action: pending.action, status: 'cancelled', detail: detailOf(pending.args) });
         return await sendTelegramMessage(chatId, 'No problem, scrapped that — nothing was changed.');
       }
       const fact = factReply(tenant, text);
-      if (fact) return await sendTelegramMessage(chatId, fact); // keep the offer open
-      if (isHelpIntent(text)) return await sendTelegramMessage(chatId, await helperReply(tenant, text)); // keep the offer open
+      if (fact) { logEvent(tenant, { kind: 'chat', action: 'fact', status: 'done' }); return await sendTelegramMessage(chatId, fact); } // keep the offer open
+      if (isHelpIntent(text)) { logEvent(tenant, { kind: 'chat', action: 'help', status: 'done' }); return await sendTelegramMessage(chatId, await helperReply(tenant, text)); } // keep the offer open
       pendingActions.delete(key); // something else entirely: drop it, treat as new
     } else if (pending) {
       pendingActions.delete(key); // expired
@@ -1688,10 +1716,10 @@ async function handleMessage(message) {
     if (THANKS_RE.test(plain)) return await sendTelegramMessage(chatId, 'Anytime.');
     if (ACK_RE.test(plain)) return await reactToMessage(chatId, message.message_id, '👍');
     const fact = factReply(tenant, text);
-    if (fact) return await sendTelegramMessage(chatId, fact);
-    if (isHelpIntent(text)) return await sendTelegramMessage(chatId, await helperReply(tenant, text));
+    if (fact) { logEvent(tenant, { kind: 'chat', action: 'fact', status: 'done' }); return await sendTelegramMessage(chatId, fact); }
+    if (isHelpIntent(text)) { logEvent(tenant, { kind: 'chat', action: 'help', status: 'done' }); return await sendTelegramMessage(chatId, await helperReply(tenant, text)); }
     const limit = limitReply(text);
-    if (limit) return await sendTelegramMessage(chatId, limit);
+    if (limit) { logEvent(tenant, { kind: 'chat', action: 'limit', status: 'blocked', reason: 'asked for something this agent cannot do' }); return await sendTelegramMessage(chatId, limit); }
 
     const parsed = FOLLOWUP_RE.test(text) && !DO_VERB_RE.test(text) ? { action: 'chat' } : await interpretCommand(tenant, text);
     let { action } = parsed;
@@ -1703,13 +1731,21 @@ async function handleMessage(message) {
     parsed.sheet_rows = parsed.sheet_rows == null ? null : normalizeRows(parsed.sheet_rows);
 
     // Does what they actually wrote support what the model picked? If not, don't act on a hunch.
+    const proposed = parsed.action;
     const veto = vetRoute(tenant, text, parsed);
-    if (veto?.reply) return await sendTelegramMessage(chatId, veto.reply);
-    if (veto?.chat) { parsed.action = 'chat'; action = 'chat'; }
+    if (veto?.reply) {
+      logEvent(tenant, { kind: 'blocked', action: 'ask', status: 'blocked', proposed, reason: 'what was written did not support it; asked for details' });
+      return await sendTelegramMessage(chatId, veto.reply);
+    }
+    if (veto?.chat) {
+      logEvent(tenant, { kind: 'blocked', action: 'chat', status: 'blocked', proposed, reason: 'what was written did not support it; treated as conversation' });
+      parsed.action = 'chat'; action = 'chat';
+    }
 
     // Is this tool switched on for this business?
     const group = ACTION_GROUP[action];
     if (group && !tenant.tools.includes(group)) {
+      logEvent(tenant, { kind: 'blocked', action, status: 'blocked', reason: 'tool not switched on for this account' });
       return await sendTelegramMessage(chatId, "That isn't switched on for your account. Ask the person who set you up if you'd like it added.");
     }
 
@@ -1733,14 +1769,16 @@ async function handleMessage(message) {
           if (action !== 'edit_excel' || args.updatedRows) {
             pendingActions.set(key, { action, args, createdAt: Date.now() });
           }
+          logEvent(tenant, { kind: 'action', action, status: 'asked', detail: detailOf(parsed) });
           return await sendTelegramMessage(chatId, confirmationMsg);
         }
       }
     }
 
-    await deliver(chatId, tenant, await executeAction(tenant, action, parsed));
+    await deliver(chatId, tenant, await runAction(tenant, action, parsed));
   } catch (err) {
     console.error(`Error handling message from chat ${chatId}:`, err);
+    if (!err?.logged) logEvent(tenant, { kind: 'error', action: 'unknown', status: 'failed', detail: err?.name || 'Error' });
     pendingActions.delete(key);
     // Admin sees the real error; businesses get a calm generic one (the real
     // error can include file paths from this computer).
@@ -1914,5 +1952,5 @@ async function setBotCommands() {
 botUsername = await getBotUsername();
 await setBotCommands();
 app.listen(PORT, () => {
-  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
+  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, action log: ${actionLog.enabled ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
 });
