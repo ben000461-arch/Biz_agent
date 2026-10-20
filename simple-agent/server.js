@@ -35,6 +35,8 @@ import { createGitHub, readPrivateKey } from './github.js';
 import { runCodeTask, parseCodeRequest } from './coder.js';
 import { createModelConnector, extractJson, PROVIDERS } from './models.js';
 import { createLogger } from './logger.js';
+import { createLinker } from './linker.js';
+import { createSignups, shortId } from './signups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -57,6 +59,7 @@ const {
   PORT = 3000,
   // Connections (optional — the bot works without them)
   PUBLIC_URL,
+  SITE_URL = 'https://ben000461-arch.github.io/coop-agent-legal/', // the website (public address, not a secret)
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   TOKEN_ENCRYPTION_KEY,
@@ -83,6 +86,8 @@ const workspacesRoot = WORKSPACES_DIR || path.join(__dirname, 'workspaces');
 
 // Action log: what the agent did (never what anyone said). Off unless both Supabase settings are present.
 const actionLog = createLogger({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+const linker = createLinker({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+const signups = createSignups({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 function logEvent(tenant, row) {
   if (!tenant) return;
   actionLog.log({ chat_id: String(tenant.chatId), business: tenant.name, ...row });
@@ -1015,6 +1020,10 @@ function factReply(tenant, raw) {
     if (!tenant.isAdmin) return `I'm an AI assistant set up for ${tenant.name}.`;
     return `I'm your assistant here in Telegram. I run on a small AI model (${OLLAMA_MODEL}) on the computer that hosts me — not ChatGPT or Claude. For code changes I hand off to ${codingAiLabel(tenant)}.`;
   }
+  if (/^(what'?s?( is)? )?(the |your |our |my )?(website|web site|site|dashboard|web ?page|login|log in|sign ?up)( link| url| address| page)?( link| url| address)?$|^(where|how) (do i|can i|to) (log ?in|sign ?up|see (my )?(logs|dashboard))$|^(link|url|address) (to|for) (the )?(website|site|dashboard)$/.test(t) && /(link|url|address|website|site|dashboard|log ?in|sign ?up|logs)/.test(t)) {
+    const base = String(SITE_URL).replace(/\/?$/, '/');
+    return `Your dashboard is here: ${base}login.html — log in to see what I've done. New here? Sign-up is ${base}login.html#signup`;
+  }
   if (/^how do you work$|^how does (this|the) (bot|assistant)( thing)? work$/.test(t)) {
     return 'You text me in plain words. I work out what you want and use the real tool for it — spreadsheets, files, email drafts, GitHub. Anything that changes something, I show you first and wait for your yes.';
   }
@@ -1282,6 +1291,93 @@ function helpText(tenant) {
   return lines.join('\n');
 }
 
+// Someone tapped the personal link from the website. They must be an APPROVED sign-up. If this chat
+// isn't a business yet, approval is what creates it (named after the business they typed in the form).
+async function handleLinkCode(chatId, tenant, code) {
+  const again = 'On the website, open Get started to get a fresh link.';
+  const say = (t) => sendTelegramMessage(chatId, t);
+  const retry = "I couldn't reach the login service just now. Tap the link again in a minute.";
+
+  const look = await linker.peek(code); // look first, so a hiccup below never burns the code
+  if (look.error === 'unavailable') return say(retry);
+  if (look.error === 'expired') return say(`That link has expired (they last 30 minutes). ${again}`);
+  if (look.error) return say(`That link has already been used or isn't valid. ${again}`);
+
+  const su = await signups.get(look.userId);
+  if (su.error) return say(retry);
+  if (!su.row || su.row.status !== 'approved') {
+    return say(su.row?.status === 'denied'
+      ? "That sign-up wasn't approved, so I can't link it."
+      : "That sign-up hasn't been approved yet. The website will say when it is. Then tap the link again.");
+  }
+
+  const got = await linker.claim(code); // now use it up (only one caller can win)
+  if (got.error === 'unavailable') return say(retry);
+  if (got.error) return say(`That link has already been used or isn't valid. ${again}`);
+
+  let t = tenant;
+  let created = false;
+  if (!t) {
+    const name = String(su.row.business_name || '').replace(/[\x00-\x1f]/g, ' ').trim().slice(0, 60) || String(got.email || '').split('@')[0] || 'New business';
+    const made = store.redeemInvite(store.createInvite(name), chatId);
+    if (made.error) return say('I could not set up your agent just now. Try the link again in a minute.');
+    t = made.tenant;
+    workspaceFor(t); // create their folder now
+    created = true;
+  }
+
+  const l = await linker.link(got.userId, chatId);
+  if (l.error) return say(`I couldn't finish linking. ${again}`);
+  const linked = `✅ Linked. This chat is now connected to the website login${got.email ? ` ${got.email}` : ''}. Open the site and you'll see your logs and connections.\n\nIf that isn't you, send /unlink right away.`;
+  await say(created ? `Hi ${t.name}! You're approved and all set. Just text me what you need.\n\n${helpText(t)}\n\n${linked}` : linked);
+  if (ADMIN_ID && String(chatId) !== ADMIN_ID) {
+    await sendTelegramMessage(ADMIN_ID, `${created ? '✅ New agent created: ' : '🔗 '}${t.name} (chat ${t.chatId}) linked the website login ${got.email || '(no email)'}.`);
+  }
+}
+
+// ---- sign-up approvals (admin only) ---------------------------------------------------------------
+const USE_LABEL = { tasks: 'Everyday tasks', dev: 'Coding / development', both: 'Both', other: 'Other' };
+const oneLine = (v, n) => String(v || '').replace(/[\x00-\x1f]+/g, ' ').trim().slice(0, n);
+const approvalState = { awaiting: null, announced: new Set() }; // awaiting = newest prompt a plain yes/no answers
+const APPROVAL_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+function signupText(r) {
+  const biz = [oneLine(r.business_name, 60) || '(no name)', oneLine(r.business_type, 80) && `(${oneLine(r.business_type, 80)})`].filter(Boolean).join(' ');
+  return [`Email: ${oneLine(r.email, 120)}`, `Business: ${biz}`, `Wants it for: ${USE_LABEL[r.use_case] || 'Other'}`, `Notes: ${oneLine(r.notes, 500) || '(none)'}`].join('\n');
+}
+
+async function announceSignups() {
+  if (!signups.enabled || !ADMIN_ID) return;
+  const r = await signups.toAnnounce(5);
+  if (r.error) return;
+  for (const row of r.rows) {
+    if (approvalState.announced.has(row.user_id)) continue;
+    approvalState.announced.add(row.user_id);
+    const id = shortId(row.user_id);
+    const busy = pendingActions.has(String(ADMIN_ID)); // a plain yes would answer that instead, so don't offer it
+    await sendTelegramMessage(ADMIN_ID, `🆕 New sign-up (their words, not ours):\n\n${signupText(row)}\n\n${busy ? `Approve: /approve_${id}\nDeny: /deny_${id}` : `Approve? Reply yes or no — or tap /approve_${id} · /deny_${id}`}`);
+    if (!busy) approvalState.awaiting = { userId: row.user_id, askedAt: Date.now() };
+    await signups.markNotified(row.user_id);
+  }
+}
+
+async function decideSignup(userId, status) {
+  const r = await signups.decide(userId, status);
+  if (approvalState.awaiting?.userId === userId) approvalState.awaiting = null;
+  if (r.error) return "I couldn't reach the database just now. Try again in a minute.";
+  if (r.already) return 'That sign-up was already decided.';
+  const name = oneLine(r.row.business_name, 60) || oneLine(r.row.email, 120);
+  return status === 'approved'
+    ? `✅ Approved ${name}. They can now tap their personal link on the website to connect.`
+    : `🚫 Denied ${name}. They won't get a link.`;
+}
+
+async function findPendingSignup(short) {
+  const r = await signups.pending(50);
+  if (r.error) return { error: true };
+  return { row: r.rows.find((x) => shortId(x.user_id) === short) || null };
+}
+
 const INVITE_ONLY_MSG = "Hi! This assistant is invite-only right now. If you've been given an invite link, tap it to get started.";
 
 let botUsername = null;
@@ -1292,7 +1388,7 @@ async function handleCommand({ chatId, text, isAdmin }) {
   const arg = text.slice(rawCmd.length).trim();
   const tenant = store.get(chatId);
 
-  const adminOnly = new Set(['/invite', '/businesses', '/remove', '/tools', '/addmodel', '/models']);
+  const adminOnly = new Set(['/invite', '/businesses', '/remove', '/tools', '/addmodel', '/models', '/signups']);
   if (adminOnly.has(cmd) && !isAdmin) {
     await sendTelegramMessage(chatId, "That command isn't available.");
     return true;
@@ -1337,6 +1433,17 @@ async function handleCommand({ chatId, text, isAdmin }) {
       store.setPrefs(chatId, { modelChoice: id });
       await sendTelegramMessage(chatId, `Okay — I'll use ${m.label} for coding. The task and the one file I'm working on go to ${m.providerLabel}${tenant.cloudOk || tenant.isAdmin ? '' : ' (I\'ll ask you once before the first time)'}.`);
     }
+    return true;
+  }
+
+  // /approve_<id> and /deny_<id>: decide a sign-up (admin only)
+  const decideTap = /^\/(approve|deny)_([a-f0-9]{8,32})$/.exec(cmd);
+  if (decideTap) {
+    if (!isAdmin) { await sendTelegramMessage(chatId, "That command isn't available."); return true; }
+    const found = await findPendingSignup(decideTap[2]);
+    await sendTelegramMessage(chatId, found.error ? "I couldn't reach the database just now. Try again in a minute."
+      : !found.row ? "I can't find that sign-up waiting. It may already be decided — try /signups."
+      : await decideSignup(found.row.user_id, decideTap[1] === 'approve' ? 'approved' : 'denied'));
     return true;
   }
 
@@ -1406,6 +1513,11 @@ async function handleCommand({ chatId, text, isAdmin }) {
     }
 
     case '/start': {
+      const linkCode = /^link_([A-Za-z0-9]{1,64})$/.exec(arg);
+      if (linkCode) {
+        await handleLinkCode(chatId, tenant, linkCode[1]);
+        return true;
+      }
       if (tenant) {
         await sendTelegramMessage(chatId, `Welcome back${tenant.isAdmin ? '' : `, ${tenant.name}`}! ${helpText(tenant)}`);
         return true;
@@ -1452,6 +1564,25 @@ async function handleCommand({ chatId, text, isAdmin }) {
       if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
       if (arg) { await sendTelegramMessage(chatId, await helperReply(tenant, arg)); return true; }
       await sendTelegramMessage(chatId, `${helpText(tenant)}\n\nLost? Send /help what should I do next`);
+      return true;
+    }
+
+    case '/signups': {
+      const r = await signups.pending(20);
+      await sendTelegramMessage(chatId, r.error ? "I couldn't reach the database just now. Try again in a minute."
+        : !r.rows.length ? 'No sign-ups are waiting.'
+        : r.rows.map((x) => `${signupText(x)}\nApprove: /approve_${shortId(x.user_id)} · Deny: /deny_${shortId(x.user_id)}`).join('\n\n— — —\n\n'));
+      return true;
+    }
+
+    case '/unlink': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      const r = await linker.unlink(chatId);
+      await sendTelegramMessage(chatId, r.error
+        ? "I couldn't reach the login service just now. Try /unlink again in a minute."
+        : r.removed
+          ? `Done. ${r.removed === 1 ? 'The website login' : `${r.removed} website logins`} tied to this chat can no longer see anything. Your agent here is unchanged, and you can link again from the website.`
+          : 'No website login is tied to this chat.');
       return true;
     }
 
@@ -1706,6 +1837,13 @@ async function handleMessage(message) {
       }
     }
 
+    // A plain yes/no answers the newest sign-up prompt, but only when no other yes/no is open.
+    const aw = approvalState.awaiting;
+    if (isAdmin && aw && !pendingActions.has(key) && Date.now() - aw.askedAt < APPROVAL_WINDOW_MS && (isConfirmation(text) || isCancellation(text))) {
+      approvalState.awaiting = null;
+      return await sendTelegramMessage(chatId, await decideSignup(aw.userId, isConfirmation(text) ? 'approved' : 'denied'));
+    }
+
     // "push it", "go ahead and commit"… typed as a normal message. Only a real offer can push, and a
     // chat model must never pretend one is waiting — so this is answered here, not by the model.
     if (PUSH_INTENT_RE.test(text)) {
@@ -1951,6 +2089,13 @@ async function setBotCommands() {
 
 botUsername = await getBotUsername();
 await setBotCommands();
+if (signups.enabled && ADMIN_ID) {
+  let polling = false;
+  const poll = async () => { if (polling) return; polling = true; try { await announceSignups(); } catch (e) { console.warn('sign-up check failed:', e.message); } finally { polling = false; } };
+  const every = Number(process.env.SIGNUP_POLL_MS) || 30000;
+  setTimeout(poll, Math.min(5000, every)).unref();
+  setInterval(poll, every).unref();
+}
 app.listen(PORT, () => {
-  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, action log: ${actionLog.enabled ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
+  console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, action log: ${actionLog.enabled ? 'on' : 'off'}, website linking: ${linker.enabled ? 'on' : 'off'}, sign-up approvals: ${signups.enabled && ADMIN_ID ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
 });
