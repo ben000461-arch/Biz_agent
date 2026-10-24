@@ -99,7 +99,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function startApp(env) {
   const proc = spawn('node', ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
-    env: { ...process.env, GROQ_API_KEY: '', HOME: path.join(tmp, 'home'), TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
+    env: { ...process.env, GROQ_API_KEY: '', SUPABASE_URL: '', SUPABASE_SERVICE_KEY: '', HOME: path.join(tmp, 'home'), TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
       TELEGRAM_API_BASE: `http://127.0.0.1:${ports.tg}`, OLLAMA_HOST: `http://127.0.0.1:${ports.ollama}`, PORT: String(ports.app),
       TENANTS_FILE: path.join(tmp, 'data', 'tenants.json'), WORKSPACES_DIR: path.join(tmp, 'ws'), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = ''; proc.stdout.on('data', (d) => (log += d)); proc.stderr.on('data', (d) => (log += d));

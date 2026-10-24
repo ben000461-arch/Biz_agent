@@ -56,6 +56,9 @@ const sb = http.createServer((req, res) => {
     const q = (k) => u.searchParams.get(k);
     const eq = (k) => (q(k) || '').replace(/^eq\./, '');
     const P = u.pathname;
+    if (P === '/rest/v1/tenant_plans' && req.method === 'GET') return res.end(JSON.stringify([{ chat_id: '0', plan: 'pro', ends_at: null, cycle_anchor: '2026-01-01', created_at: '2026-01-01T00:00:00Z', last_reminder: null }])); // every business is on Pro here
+    if (P === '/rest/v1/credit_ledger' && req.method === 'GET') return res.end(JSON.stringify([{ ts: '2026-01-01T00:00:00Z', delta: 3500, reason: 'grant' }]));
+    if (P === '/rest/v1/credit_ledger' && req.method === 'POST') { res.statusCode = 201; return res.end(''); }
     if (P === '/rest/v1/agent_logs' && req.method === 'POST') { for (const r of JSON.parse(body)) logRows.push(r); res.statusCode = 201; return res.end(''); }
     if (P === '/rest/v1/link_codes' && req.method === 'GET') { const row = codes.get(eq('code')); return res.end(JSON.stringify(row ? [{ code: eq('code'), ...row }] : [])); }
     if (P === '/rest/v1/link_codes' && req.method === 'DELETE') { const c = eq('code'); const row = codes.get(c); codes.delete(c); return res.end(JSON.stringify(row ? [{ code: c, ...row }] : [])); }
@@ -146,7 +149,7 @@ for (const [s, p] of [[tg, ports.tg], [ollama, ports.ollama], [sb, ports.sb]]) a
 function startApp(env, port = ports.app) {
   const proc = spawn('node', ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
-    env: { ...process.env, GROQ_API_KEY: '', HOME: path.join(tmp, 'home'), TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
+    env: { ...process.env, GROQ_API_KEY: '', SUPABASE_URL: '', SUPABASE_SERVICE_KEY: '', HOME: path.join(tmp, 'home'), TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
       TELEGRAM_API_BASE: `http://127.0.0.1:${ports.tg}`, OLLAMA_HOST: `http://127.0.0.1:${ports.ollama}`, PORT: String(port),
       TENANTS_FILE: path.join(tmp, `data-${port}`, 'tenants.json'), WORKSPACES_DIR: path.join(tmp, 'ws'), SIGNUP_POLL_MS: '300', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = ''; proc.stdout.on('data', (d) => (log += d)); proc.stderr.on('data', (d) => (log += d));

@@ -128,7 +128,7 @@ vault0.set('111', 'github', { installationId: '777' }, { label: 'fire-dept' });
 vault0.set('222', 'github', { installationId: '888' }, { label: 'other-biz' });
 
 const env = {
-  ...process.env, HOME: path.join(tmp, 'home'),
+  ...process.env, SUPABASE_URL: '', SUPABASE_SERVICE_KEY: '', GROQ_API_KEY: '', HOME: path.join(tmp, 'home'),
   TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
   TELEGRAM_API_BASE: `http://127.0.0.1:${P.tg}`, OLLAMA_HOST: `http://127.0.0.1:${P.ollama}`,
   PORT: String(P.app), TENANTS_FILE: path.join(tmp, 'data', 'tenants.json'), WORKSPACES_DIR: path.join(tmp, 'ws'), CONNECTIONS_FILE: connFile,

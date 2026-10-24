@@ -55,6 +55,7 @@ export function createEntitlements({
       planKey, endsAt: ends ? new Date(ends).toISOString() : null,
       cycleStart: cycleStart(row.cycle_anchor || row.created_at || new Date(t).toISOString(), new Date(t)),
       createdAt: row.created_at || null,
+      anchor: row.cycle_anchor ? String(row.cycle_anchor).slice(0, 10) : null, // billing day-of-month, for "resets on…" dates
     };
     if (planKey === 'frozen') return { ...base, state: 'frozen', canUse: false, reason: 'manual', plan: null };
     if (!PLANS[planKey]) return { ...base, state: 'frozen', canUse: false, reason: 'unknown_plan', plan: null }; // bad data fails closed

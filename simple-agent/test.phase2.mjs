@@ -21,6 +21,7 @@ let sbMode = 'ok';     // 'ok' | 'down' (plan lookups fail)
 const rows = {};       // chat_id -> tenant_plans row
 const patches = [];    // { chat, body }
 const posts = [];
+const ledger = [];
 
 const roleOf = (system) => (system.includes('You read a short message') ? 'router' : system.includes('helpful, direct assistant') ? 'chat' : 'other');
 const answer = (system, who) => (roleOf(system) === 'router' ? { action: 'chat' } : { reply: `hi from ${who}` });
@@ -51,6 +52,15 @@ const sb = http.createServer(async (req, res) => {
   const raw = await readBody(req);
   res.setHeader('content-type', 'application/json');
   const u = new URL(req.url, 'http://x');
+  if (u.pathname.endsWith('/credit_ledger')) { // a small fake ledger, with the one-grant-per-cycle rule
+    if (req.method === 'GET') {
+      const chat = /eq\.(-?\d+)/.exec(u.search)?.[1]; const cycle = /cycle=eq\.([\d-]+)/.exec(u.search)?.[1];
+      return res.end(JSON.stringify(ledger.filter((r) => r.chat_id === chat && r.cycle === cycle)));
+    }
+    const row = JSON.parse(raw);
+    if (row.reason === 'grant' && ledger.some((r) => r.chat_id === row.chat_id && r.cycle === row.cycle && r.reason === 'grant')) { res.statusCode = 409; return res.end('{}'); }
+    ledger.push({ ts: new Date().toISOString(), ...row }); res.statusCode = 201; return res.end('[]');
+  }
   if (!u.pathname.endsWith('/tenant_plans')) { res.statusCode = 201; return res.end('[]'); } // action log etc.
   const chat = /eq\.(-?\d+)/.exec(u.search)?.[1];
   if (req.method === 'GET') {

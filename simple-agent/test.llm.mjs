@@ -100,6 +100,13 @@ const mk = (script, extra = {}) => { const f = fake(script); return { f, llm: cr
   const r = await llm.run(PLANS.pro, 'chat', { system: 's', user: 'u', tierOverride: 'small' });
   ok(r.tier === 'small' && f.calls[0].body.model === 'openai/gpt-oss-20b', 'override picks small');
 }
+// 11b. override small never climbs back up to large, even when small is down
+{
+  const { f, llm } = mk([{ status: 500 }, { status: 500 }, { text: 'local ok' }]);
+  const r = await llm.run(PLANS.pro, 'chat', { system: 's', user: 'u', tierOverride: 'small' });
+  ok(r.tier === 'local' && f.calls.every((c) => !c.body.model || c.body.model !== 'openai/gpt-oss-120b'), 'override small never uses large');
+  ok(r.role === 'chat', 'receipt carries the role');
+}
 // 12. log gets metadata only
 {
   const logs = [];

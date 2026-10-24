@@ -106,7 +106,7 @@ const gh = http.createServer((req, res) => {
 for (const [s, p] of [[tg, P.tg], [ollama, P.ollama], [gh, P.gh]]) await new Promise((r) => s.listen(p, r));
 
 const baseEnv = () => ({
-  ...process.env, HOME: path.join(tmp, 'home'),
+  ...process.env, SUPABASE_URL: '', SUPABASE_SERVICE_KEY: '', GROQ_API_KEY: '', HOME: path.join(tmp, 'home'),
   TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
   TELEGRAM_API_BASE: `http://127.0.0.1:${P.tg}`, OLLAMA_HOST: `http://127.0.0.1:${P.ollama}`,
   PORT: String(P.app), TENANTS_FILE: path.join(tmp, 'data', 'tenants.json'), WORKSPACES_DIR: path.join(tmp, 'ws'), CONNECTIONS_FILE: connFile,

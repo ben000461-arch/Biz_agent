@@ -99,7 +99,7 @@ export function createLLM({
           if (o.json) {
             try { data = JSON.parse(text); } catch { throw { retryable: true, message: 'invalid json' }; }
           }
-          const receipt = { tier, model: names[tier], degraded: i > 0, firstChoice: tiers[0], ms: Date.now() - t0, usage, attempts: attempts.length + 1 };
+          const receipt = { role: o.role || null, tier, model: names[tier], degraded: i > 0, firstChoice: tiers[0], ms: Date.now() - t0, usage, attempts: attempts.length + 1 };
           log(receipt);
           return { data, text, ...receipt };
         } catch (e) {
@@ -123,8 +123,11 @@ export function createLLM({
   // Convenience: run a role for an entitlement's plan. `tierOverride` lets the credit meter force the cheap tier.
   function run(plan, role, opts = {}) {
     const { tierOverride, ...rest } = opts;
-    const tiers = tierOverride ? [tierOverride, ...tiersFor(plan, role).filter((t) => t !== tierOverride)] : tiersFor(plan, role);
-    return call({ ...rest, tiers });
+    // An override (the credit meter forcing the cheap tier) must never fall back UP to the expensive one.
+    const tiers = tierOverride
+      ? [tierOverride, ...tiersFor(plan, role).filter((t) => t !== tierOverride && !(tierOverride === 'small' && t === 'large'))]
+      : tiersFor(plan, role);
+    return call({ ...rest, tiers, role });
   }
 
   // What to tell someone who asks "what model are you?" — built from what is really configured.
