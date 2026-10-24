@@ -37,6 +37,9 @@ import { createModelConnector, extractJson, PROVIDERS } from './models.js';
 import { createLogger } from './logger.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createLLM } from './llm.js';
+import { createEntitlements, frozenMessage, trialReminderMessage } from './entitlement.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -88,6 +91,26 @@ const workspacesRoot = WORKSPACES_DIR || path.join(__dirname, 'workspaces');
 const actionLog = createLogger({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const linker = createLinker({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const signups = createSignups({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+
+// Plans + models. The model layer (llm.js) turns a plan's tiers into real models; entitlements say what each
+// chat is allowed to do. "als" carries the current chat's plan to wherever a model is called, so no function
+// signature has to change.
+const als = new AsyncLocalStorage();
+const llm = createLLM({
+  groqKey: process.env.GROQ_API_KEY || '',
+  groqBase: GROQ_API_BASE || undefined,
+  ollamaHost: OLLAMA_HOST,
+  models: { small: process.env.LLM_SMALL_MODEL, large: process.env.LLM_LARGE_MODEL, local: OLLAMA_MODEL },
+  log: (r) => {
+    const c = als.getStore();
+    if (c && !r.failed) (c.receipts ||= []).push(r); // the credit meter (next step) reads these
+    console.log(r.failed ? `[llm] failed after ${r.attempts.length} attempt(s): ${r.attempts.map((a) => `${a.tier}:${a.reason}`).join(', ')}` : `[llm] ${r.tier} (${r.model}) ${r.ms}ms${r.degraded ? ` FALLBACK from ${r.firstChoice}` : ''} tokens in/out ${r.usage?.in ?? '?'}/${r.usage?.out ?? '?'}`);
+  },
+});
+const entitlements = createEntitlements({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
+// Commands a paused (frozen) customer may still use: seeing help, and disconnecting their own accounts.
+const FROZEN_OK_COMMANDS = new Set(['/start', '/help', '/connections', '/disconnect', '/disconnect_google', '/disconnect_github', '/disconnect_model', '/unlink']);
 function logEvent(tenant, row) {
   if (!tenant) return;
   actionLog.log({ chat_id: String(tenant.chatId), business: tenant.name, ...row });
@@ -299,33 +322,20 @@ async function getBotUsername() {
 // Local model
 // ---------------------------------------------------------------------------
 
-async function callLocalModel(systemPrompt, userText, { model = OLLAMA_MODEL, timeoutMs = 90_000, history = [], temperature = 0 } = {}) {
-  let res;
+// Every router / writer / chat model call goes through llm.js. "role" says what the call is for; the
+// current chat's plan (via als) says which model that role uses and what to fall back to.
+async function callLocalModel(systemPrompt, userText, { role = 'router', history = [], temperature = 0, timeoutMs } = {}) {
+  const ctx = als.getStore();
   try {
-    res = await fetch(`${OLLAMA_HOST}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(timeoutMs), // never let a hung model block a chat forever
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...history,
-          { role: 'user', content: userText },
-        ],
-        format: 'json',
-        stream: false,
-        options: { temperature, num_ctx: 4096 },
-      }),
+    const r = await llm.run(ctx?.ent?.plan || null, role, {
+      system: systemPrompt, user: userText, history, temperature, json: true,
+      maxTokens: role === 'chat' ? 1200 : 3000,
+      ...(timeoutMs ? { timeoutMs } : {}),
     });
+    return r.data;
   } catch (err) {
-    throw new Error(`Couldn't reach the local model (${err.name}) — is "ollama serve" running?`);
+    throw new Error("Couldn't reach the AI model right now.");
   }
-  if (!res.ok) {
-    throw new Error(`Ollama API error: ${res.status} ${await res.text()} — is "ollama serve" running?`);
-  }
-  const data = await res.json();
-  return JSON.parse(data.message.content);
 }
 
 // Answer from the bigger coding model. It is STREAMED: a non-streamed request
@@ -514,7 +524,7 @@ function formatRowsAsText(rows) {
 
 async function editExcelWithLLM(currentRows, instruction) {
   const systemPrompt = `You are given the current contents of a spreadsheet as a JSON array of rows (the first row is the header). Apply the requested change and return the FULL updated table — every existing row that should remain, plus any additions or edits requested. Keep everything not mentioned in the request unchanged. Respond ONLY with valid JSON: {"rows": [[...], [...], ...]}`;
-  const parsed = await callLocalModel(systemPrompt, `Current table:\n${JSON.stringify(currentRows)}\n\nRequested change:\n${instruction}`);
+  const parsed = await callLocalModel(systemPrompt, `Current table:\n${JSON.stringify(currentRows)}\n\nRequested change:\n${instruction}`, { role: 'writer' });
   const rows = normalizeRows(parsed.rows);
   if (rows.length === 0) throw new Error('Model did not return a usable table');
   return rows;
@@ -945,7 +955,7 @@ Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
   try {
     const history = recall(tenant.chatId);
     if (history.length && history[history.length - 1].role === 'user') history.pop(); // the current message is sent separately
-    const out = await callLocalModel(systemPrompt, userText, { history, temperature: 0.5 });
+    const out = await callLocalModel(systemPrompt, userText, { role: 'chat', history, temperature: 0.5 });
     const r = typeof out?.reply === 'string' ? out.reply.trim() : '';
     return r ? trimChatReply(r) : null;
   } catch (err) {
@@ -1018,7 +1028,7 @@ function factReply(tenant, raw) {
   }
   if (/^(what|which) (llm|model|ai|language model|brain|engine)\b.*\b(you|run|runs|power|powers|host|hosts|use|uses|are)\b|^(what|who) (runs|powers|hosts) you$|^what are you$|^who are you$|^what'?s? (is )?your name$|^are you (chatgpt|gpt|claude|gemini|llama|an? (ai|bot|robot|llm))$/.test(t)) {
     if (!tenant.isAdmin) return `I'm an AI assistant set up for ${tenant.name}.`;
-    return `I'm your assistant here in Telegram. I run on a small AI model (${OLLAMA_MODEL}) on the computer that hosts me — not ChatGPT or Claude. For code changes I hand off to ${codingAiLabel(tenant)}.`;
+    return `I'm your assistant here in Telegram. I run on ${llm.describe(als.getStore()?.ent?.plan || null, 'chat')} — not ChatGPT or Claude. For code changes I hand off to ${codingAiLabel(tenant)}.`;
   }
   if (/^(what'?s?( is)? )?(the |your |our |my )?(website|web site|site|dashboard|web ?page|login|log in|sign ?up)( link| url| address| page)?( link| url| address)?$|^(where|how) (do i|can i|to) (log ?in|sign ?up|see (my )?(logs|dashboard))$|^(link|url|address) (to|for) (the )?(website|site|dashboard)$/.test(t) && /(link|url|address|website|site|dashboard|log ?in|sign ?up|logs)/.test(t)) {
     const base = String(SITE_URL).replace(/\/?$/, '/');
@@ -1784,7 +1794,32 @@ async function deliver(chatId, tenant, result) {
   if (result.file && (!tenant.isAdmin || result.sendFile)) await sendTelegramDocument(chatId, result.file);
 }
 
+// The front door for every Telegram message: look up the plan, stop paused customers, send trial reminders,
+// then run the normal handler with the plan available to every model call underneath.
 async function handleMessage(message) {
+  const chatId = message.chat.id;
+  const tenant = store.get(chatId);
+  const text = (message.text || '').trim();
+  if (!tenant || !text) return handleMessageInner(message); // strangers and empty messages: unchanged
+  let ent;
+  try { ent = await entitlements.get(tenant); } catch { ent = null; }
+  if (!ent) return handleMessageInner(message);
+  if (!ent.canUse) {
+    const cmd = text.startsWith('/') ? text.split(/[\s@]/)[0].toLowerCase() : '';
+    if (!FROZEN_OK_COMMANDS.has(cmd)) {
+      logEvent(tenant, { kind: 'blocked', action: 'frozen', status: 'blocked', reason: ent.reason || 'paused' });
+      return sendTelegramMessage(chatId, frozenMessage(ent, { siteUrl: String(SITE_URL).replace(/\/?$/, '/') }));
+    }
+  }
+  const due = entitlements.reminderDue(ent);
+  if (due) {
+    const marked = await entitlements.markReminder(tenant.chatId, due); // mark first, so a failure never means a repeat
+    if (marked.ok) await sendTelegramMessage(chatId, trialReminderMessage(ent));
+  }
+  return als.run({ tenant, ent }, () => handleMessageInner(message));
+}
+
+async function handleMessageInner(message) {
   const chatId = message.chat.id;
   const key = String(chatId);
   const fromId = message.from?.id;
