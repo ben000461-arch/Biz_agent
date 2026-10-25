@@ -42,6 +42,7 @@ import { createLLM } from './llm.js';
 import { createEntitlements, frozenMessage, trialReminderMessage } from './entitlement.js';
 import { createMeter, decide, crossing, nextReset, blockMessage, warningMessage, usageMessage, rateLimitMessage, actionCosts } from './meter.js';
 import { PLANS as PLAN_TABLE, SETTABLE_PLANS, creditCost } from './plans.js';
+import { createWebAuth, mountWebChat } from './webchat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -273,6 +274,7 @@ function fixStrayUnicodeEscapes(text) {
 // Keep a chat reply short: at most two sentences. Abbreviations like "e.g." and times like "3:47 PM."
 // must not count as the end of a sentence.
 function trimChatReply(reply) {
+  if (reply.includes('```')) return reply.replace(/\r/g, '').trim().slice(0, 3500); // code keeps its line breaks and length
   const text = reply.replace(/\s+/g, ' ').trim()
     .replace(/\b(e)\.(g)\./gi, '$1\u0001$2\u0001').replace(/\b(i)\.(e)\./gi, '$1\u0001$2\u0001')
     .replace(/\b(etc|vs|approx|Mr|Mrs|Ms|Dr|St|No)\./g, '$1\u0001');
@@ -314,6 +316,12 @@ function remember(chatId, role, text) {
   list.push({ role, content: clean, at: Date.now() });
   chatMemory.set(key, list.slice(-MEMORY_MAX_TURNS));
 }
+// A new chat on the website starts clean; reopening an old one hands back its last few turns.
+function resetMemory(chatId, turns = []) {
+  chatMemory.delete(String(chatId));
+  pendingActions.delete(String(chatId));
+  for (const t of turns) remember(chatId, t.role === 'assistant' ? 'assistant' : 'user', t.text);
+}
 function recall(chatId) {
   const list = (chatMemory.get(String(chatId)) || []).filter((m) => Date.now() - m.at < MEMORY_TTL_MS);
   // the chat model answers in JSON, so show its earlier turns the same way
@@ -324,6 +332,8 @@ function recall(chatId) {
 async function sendTelegramMessage(chatId, text) {
   let clean = fixStrayUnicodeEscapes(String(text));
   if (clean.length > 4000) clean = `${clean.slice(0, 3990)}\n…(trimmed)`; // Telegram caps messages at 4096
+  const webSink = als.getStore()?.sink; // a message typed on the website: the answer goes back to the website
+  if (webSink) { webSink.push(clean); remember(chatId, 'assistant', clean); return; }
   const res = await fetch(`${TG}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -334,6 +344,15 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 async function sendTelegramDocument(chatId, filePath, caption) {
+  const webSink = als.getStore()?.sink;
+  if (webSink) { // the page offers it as a download (up to 4 MB)
+    try {
+      const buf = fs.readFileSync(filePath);
+      if (buf.length > 4 * 1024 * 1024) webSink.push(`I made a file (${path.basename(filePath)}) but it's too big to download here. Ask me for it in Telegram.`);
+      else webSink.pushFile({ name: path.basename(filePath), data: buf.toString('base64') });
+    } catch { webSink.push('I made a file but couldn\'t read it back. Try again.'); }
+    return;
+  }
   const form = new FormData();
   form.append('chat_id', String(chatId));
   if (caption) form.append('caption', caption);
@@ -971,6 +990,7 @@ function codingAiLabel(tenant) {
   return sel ? `${sel.label} (a cloud AI, used only for code changes)` : `the same local model (${OLLAMA_MODEL})`;
 }
 
+const CLAIMED_ACTION_RE = /\b(?:connected|reconnected|re-?authorized|linked|disconnected)\b[^.?!]{0,60}\b(?:now|ready|successfully|account|for (?:drafting|use))\b|\bi(?:'ve| have|'m| am| just)? (?:now |just )?(?:connect|reconnect|link|re-?authorize|disconnect)(?:ed|ing)\b|\b(?:re-?connecting|connecting)\b[^.?!]{0,40}\bnow\b|\bshall i (?:re-?)?connect\b/i;
 async function chatReply(tenant, userText) {
   const about = tenant.isAdmin ? '' : ` You work for a business called "${tenant.name}".${tenant.instructions ? ` Owner's notes: ${tenant.instructions}` : ''}`;
   const caps = capabilityList(tenant);
@@ -984,16 +1004,17 @@ FACTS about your tools and limits — the ONLY things you know about them. Never
 ${repos.length ? `- Their GitHub projects: ${repos.slice(0, 6).join(', ')}. Code work: if they ask whether you can help with code, say yes — you can fix a bug, add a feature or edit a file in ${repos[0].split('/').pop()}, show the change first, and push only if they say yes — then ask what they need done. Don't show command syntax; they can just describe it.\n` : ''}ABOUT YOURSELF: don't mention what model or computer you run on, and don't talk about yourself unless asked. If asked about your wants, feelings, personality, or to rate yourself, answer briefly and lightly — you're an AI, so no real wants or feelings — and never invent limitations or abilities.
 HOW TO REPLY
 - Chat like a smart, honest friend. Answer from your own knowledge, accurately. If you're not sure, say "I'm not sure" — never guess or make things up (no invented times, news, numbers, or facts about yourself).
-- Be brief: one or two sentences, never more. No lists, no tutorials. No filler questions like "how can I help you today?"; ask a question only when you need the answer to help.
+- Be brief: one or two sentences, never more, and no lists or tutorials — EXCEPT when they ask for code or a how-to: then give a complete answer, and put every piece of code in a fenced block that names the language and puts each line of code on its own line (for example \`\`\`python on its own line, the code, then \`\`\` on its own line). No filler questions like "how can I help you today?"; ask a question only when you need the answer to help.
 - Use the conversation so far. When they refer to something said earlier, answer from it. Never claim you didn't say something you did, and never contradict yourself.
 - If they ask for something your tools do, tell them to just ask in plain words, with one example.
-- Never say you've sent, saved, pushed or are waiting for a confirmation — a chat reply can't do any of that. To push code they send /changes.
+- Never say you've sent, saved, pushed, connected, reconnected or linked anything, or that you are waiting for a confirmation — a chat reply can't do any of that. To connect or reconnect Google, GitHub or an AI key, the person types: connect. To push code they send /changes.
 Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
   try {
     const history = recall(tenant.chatId);
     if (history.length && history[history.length - 1].role === 'user') history.pop(); // the current message is sent separately
     const out = await callLocalModel(systemPrompt, userText, { role: 'chat', history, temperature: 0.5 });
     const r = typeof out?.reply === 'string' ? out.reply.trim() : '';
+    if (r && CLAIMED_ACTION_RE.test(r)) return 'I can\'t connect or change accounts just by chatting. Say "connect" and I\'ll give you the secure links.';
     return r ? trimChatReply(r) : null;
   } catch (err) {
     console.error('chatReply failed:', err.message);
@@ -1006,6 +1027,8 @@ Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
 const THANKS_RE = /^(thanks|thank you|thx|ty|thank u|thanks a lot|thank you so much|thanks so much)$/;
 const ACK_RE = /^(ok|okay|k|kk|got it|gotcha|cool|nice|great|sure|alright|all right|fine|understood|i see|makes sense|good to know|interesting|intresting|interessting|wow|ha+h*a*h*|he(he)+|lol|lmao|nvm|nevermind|never mind|yup|yep|yeah|nope|nah|hmm+|ah|oh|oh ok|oh okay|oh i see)( thanks| thank you)?$/;
 async function reactToMessage(chatId, messageId, emoji) {
+  const webSink = als.getStore()?.sink;
+  if (webSink) { webSink.push(emoji); return; }
   if (!messageId) return;
   try {
     await fetch(`${TG}/setMessageReaction`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] }) });
@@ -1870,6 +1893,21 @@ async function handleStranger(chatId, message) {
   await sendTelegramMessage(chatId, INVITE_ONLY_MSG);
 }
 
+// "what are my connections", "connect google", "can we hook up github": answered by the real commands, never by a guess.
+function connectionsIntent(raw) {
+  const t = String(raw || '').toLowerCase().replace(/[?!.]+$/g, '').trim();
+  if (!t || t.length > 80 || /\b(how|why|when|safe|secure|work|works|does|do you|are you|did you|disconnect|unlink|remove|delete|code|python)\b/.test(t)) return null;
+  if (/^(what|which|show|list|see|check|view)\b.*\b(my|our)\b.*\b(connections?|connected|integrations?)\b/.test(t) || /^(my )?(connections|integrations)$/.test(t)) return '/connections';
+  const words = t.split(/\s+/);
+  if (words.length <= 7 && /\b(?:re-?)?conn?e+c?t(?:ing)?\b|\bre-?connet\b|\bconect\b|\bhook up\b|\bsign in to\b/.test(t)) {
+    if (/\b(google|gmail|calendar|google calendar)\b/.test(t)) return '/connect google';
+    if (/\bgithub\b/.test(t)) return '/connect github';
+    if (/\b(api key|ai model|my own model|model)\b/.test(t)) return '/connect model';
+    if (words.every((w) => /^(?:can|could|will|would|we|you|i|u|please|let'?s|lets|want|need|like|wanna|to|a|my|the|an|some|(?:re-?)?conn?e+c?t(?:ing)?|re-?connet|conect|hook|up|set|setup|tool|tools|app|apps|account|accounts|service|services|something|again|new|another|other|one)$/.test(w))) return '/connect';
+  }
+  return null;
+}
+
 async function deliver(chatId, tenant, result) {
   await sendTelegramMessage(chatId, result.text);
   // Businesses can't open a folder on this computer, so send them the file.
@@ -1901,7 +1939,7 @@ async function handleMessage(message) {
     const marked = await entitlements.markReminder(tenant.chatId, due); // mark first, so a failure never means a repeat
     if (marked.ok) await sendTelegramMessage(chatId, trialReminderMessage(ent));
   }
-  return als.run({ tenant, ent }, () => handleMessageInner(message));
+  return als.run({ tenant, ent, sink: als.getStore()?.sink }, () => handleMessageInner(message));
 }
 
 async function handleMessageInner(message) {
@@ -1968,6 +2006,12 @@ async function handleMessageInner(message) {
     // chat model must never pretend one is waiting — so this is answered here, not by the model.
     if (PUSH_INTENT_RE.test(text)) {
       return await sendTelegramMessage(chatId, "I can't push from a plain message, and nothing is waiting for a yes right now. I only push right after I show you a change (I ask \"Want me to push this?\"), or from /changes, where you pick a saved change to push.");
+    }
+
+    const asked = connectionsIntent(text);
+    if (asked && (await handleCommand({ chatId, text: asked, isAdmin }))) {
+      logEvent(tenant, { kind: 'command', action: asked.split(' ')[0], status: 'done' });
+      return;
     }
 
     const plain = norm(text);
@@ -2081,6 +2125,28 @@ function secretOk(req) {
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// The website's chat box. Same engine as Telegram; the answer goes back to the page instead.
+// Only the website's own address may call it (SITE_URL, plus WEB_ORIGINS if you list more, comma-separated).
+const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+mountWebChat(app, {
+  express,
+  auth: webAuth,
+  getTenant: (chatId) => store.get(chatId),
+  siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
+  extraOrigins: String(process.env.WEB_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  run: async (tenant, text, opts = {}) => {
+    const replies = [], files = [];
+    // Only the owner's own verified login, tied to the owner's chat, gets owner powers. Everyone else is a normal customer.
+    const fromId = ADMIN_ID && tenant.isAdmin && String(tenant.chatId) === ADMIN_ID ? ADMIN_ID : 'web';
+    const message = { chat: { id: Number(tenant.chatId) }, from: { id: fromId }, text, message_id: null };
+    const sink = { push: (t) => replies.push(String(t)), pushFile: (f) => files.push(f) };
+    await enqueue(String(tenant.chatId), () => { if (opts.fresh) resetMemory(tenant.chatId, opts.history || []); return als.run({ sink }, () => handleMessage(message)); });
+    return { replies, files };
+  },
+  log: (line) => console.log(line),
+});
+console.log(`Website chat: ${webAuth.enabled ? 'on (POST /web/chat)' : 'OFF (needs the Supabase settings)'}.`);
 
 // Where Google sends people back after they approve. The `state` value ties
 // the visit to the chat that asked for the link.
