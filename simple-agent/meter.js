@@ -20,7 +20,7 @@ const utcDate = (t) => new Date(t).toISOString().slice(0, 10);
 // Actions that cost us nothing to run (pure code, no outside service) don't spend credits.
 // Everything else that does real work costs CREDIT_COSTS.action. Edit this list to change what is free.
 export const CREDIT_FREE_ACTIONS = new Set([
-  'chat', 'add', 'multiply', 'add_note', 'list_notes', 'disconnect', 'remove_model', 'cloud_ok', 'push_change',
+  'chat', 'add', 'multiply', 'add_note', 'list_notes', 'disconnect', 'remove_model', 'cloud_ok', 'push_change', 'agent_delete',
 ]);
 export const actionCosts = (action) => !CREDIT_FREE_ACTIONS.has(action);
 

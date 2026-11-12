@@ -41,7 +41,7 @@ const ollama = http.createServer((req, res) => {
 });
 
 // fake Google
-const SC = ['https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/calendar.readonly'];
+const SC = ['https://www.googleapis.com/auth/gmail.compose', 'https://www.googleapis.com/auth/calendar.events'];
 const g = { drafts: [], revoked: [], tokenCalls: [], refreshRevoked: false, badAuth: 0, calendarQuery: null };
 const google = http.createServer((req, res) => {
   const c = []; req.on('data', (d) => c.push(d));

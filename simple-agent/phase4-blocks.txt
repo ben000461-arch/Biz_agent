@@ -1,0 +1,277 @@
+//#### CORE
+// ---------------------------------------------------------------------------
+// Time zones, booking events on the calendar, and agents (phase 4).
+// when.js reads dates/times in plain words; agents.js is the build-an-agent questions; google.js talks to Google.
+// ---------------------------------------------------------------------------
+const SERVER_TZ = validTz(process.env.TZ) ? process.env.TZ : (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } })();
+const tenantTz = (tenant) => (validTz(tenant?.tz) ? tenant.tz : SERVER_TZ);
+const TIME_ASK = 'What time should I put it? For example: schedule a meeting with Tom tomorrow at 3pm.';
+const DAY_TIME_ASK = 'What day and time? For example: schedule a meeting with Tom tomorrow at 3pm.';
+
+// Is this message an order to put something on the calendar? Code decides, from their own words — the AI only
+// helps with the title. Fills in the start/end/title, or says what's missing.
+function vetBooking(tenant, text, parsed) {
+  const booking = looksLikeBooking(text);
+  const a = parsed.action;
+  if (!booking) {
+    if (a === 'create_event') { // the AI picked "add to calendar" but they only asked about their schedule
+      if (/\b(calendar|schedule|agenda|meetings?|appointments?|events?)\b/i.test(text)) { parsed.action = 'list_events'; parsed.when = /\btomorrow\b/i.test(text) ? 'tomorrow' : /\bweek\b/i.test(text) ? 'week' : 'today'; }
+      else parsed.action = 'chat';
+    }
+    return null;
+  }
+  if (a && !['list_events', 'chat', 'create_event', 'add_note', 'write_file'].includes(a)) return null; // a spreadsheet or email request keeps its own route
+  parsed.action = 'create_event';
+  const tz = tenantTz(tenant);
+  const w = parseWhen(text, { tz });
+  if (!w) return { reply: DAY_TIME_ASK };
+  if (!w.hasTime) return { reply: TIME_ASK };
+  if (w.past) return { reply: 'That time has already passed today. Did you mean tomorrow? Try: schedule a meeting with Tom tomorrow at 3pm.' };
+  const dur = parseDuration(text) || 60;
+  parsed.startISO = w.start.toISOString();
+  parsed.endISO = new Date(w.start.getTime() + dur * 60000).toISOString();
+  parsed.vague = w.vague; parsed.rolled = w.rolled; parsed.tz = tz;
+  const words = new Set(String(text).toLowerCase().match(/[a-z]{3,}/g) || []);
+  const t = typeof parsed.title === 'string' ? parsed.title.replace(/\s+/g, ' ').trim() : '';
+  const grounded = t && t.length <= 80 && !/^(null|none|n\/a|undefined)$/i.test(t) && (t.toLowerCase().match(/[a-z]{3,}/g) || []).some((x) => words.has(x));
+  parsed.title = grounded ? t : deriveTitle(text);
+  return null;
+}
+
+// The "I'll add this — OK?" message. Returns text; sets args.confirmOk only when there is really something to confirm.
+async function confirmEventPrompt(tenant, args) {
+  if (!google) return "Calendar isn't set up on this server yet.";
+  if (!google.isConnected(tenant.chatId)) return "Your calendar isn't connected yet — send /connect to link your Google account, then ask again.";
+  const tz = args.tz || tenantTz(tenant);
+  const start = new Date(args.startISO), end = new Date(args.endISO);
+  let clash = [];
+  try {
+    clash = (await google.eventsBetween(tenant.chatId, args.startISO, args.endISO)).filter((e) => !e.allDay).slice(0, 3);
+  } catch (err) {
+    if (err instanceof NeedsReconnect) return 'Your Google connection has expired — send /connect to reconnect, then ask again.';
+    // can't check for clashes right now: still fine to ask
+  }
+  args.confirmOk = true;
+  const sp = zonedParts(start, tz), ep = zonedParts(end, tz);
+  const mins = Math.round((end - start) / 60000);
+  const dur = mins % 60 === 0 ? `${mins / 60} hour${mins === 60 ? '' : 's'}` : mins > 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`;
+  let msg = `I'll add this to your Google Calendar:\n\n📅 ${args.title}\n🕒 ${formatWhen(start, tz)} – ${clock12(ep.h, ep.mi)} ${tzAbbrev(start, tz)} (${dur})`;
+  if (clash.length) msg += `\n⚠️ Heads up — you already have ${clash.map((e) => { const p = zonedParts(new Date(e.start), tz); return `"${e.title}" at ${clock12(p.h, p.mi)}`; }).join(' and ')} then.`;
+  if (args.vague) msg += `\n(You didn't say AM or PM, so I guessed ${clock12(sp.h, sp.mi)}.)`;
+  if (args.rolled) msg += `\n(That time has already passed, so I used the next one.)`;
+  return `${msg}\n\nAdd it? (yes/no)`;
+}
+
+// Runs only after the owner said yes.
+async function createEventAction(tenant, args) {
+  if (!google?.isConnected(tenant.chatId)) return { text: "Your calendar isn't connected yet — send /connect to link your Google account." };
+  const tz = args.tz || tenantTz(tenant);
+  try {
+    await google.createEvent(tenant.chatId, { title: args.title, startISO: args.startISO, endISO: args.endISO, tz });
+  } catch (err) {
+    if (err instanceof NeedsMoreAccess) return { text: 'To add events I need a bit more permission than you gave me before. Send /connect google, approve it again, then say it again. Nothing was added.' };
+    if (err instanceof NeedsReconnect) return { text: 'Your Google connection has expired — send /connect to reconnect, then ask again. Nothing was added.' };
+    console.warn('[calendar] add failed:', err?.message);
+    return { text: "I couldn't add it to your calendar just now, so nothing was added. Try again in a minute." };
+  }
+  const ep = zonedParts(new Date(args.endISO), tz);
+  return { text: `Added to your calendar ✅\n📅 ${args.title}\n🕒 ${formatWhen(new Date(args.startISO), tz)} – ${clock12(ep.h, ep.mi)}` };
+}
+
+// ---- agents ----
+const agentDrafts = new Map(); // chatId -> where they are in the build-an-agent questions
+const manualRuns = new Map(); // chatId -> { day, n } so "run it now" can't be spammed
+const MAX_MANUAL_RUNS = Number(process.env.AGENT_MANUAL_RUNS_PER_DAY) || 10;
+const agentCap = (tenant) => Math.min(10, Math.max(1, Number(tenant?.agentCap) || Number(process.env.MAX_AGENTS) || agentKit.DEFAULT_MAX_AGENTS));
+function agentCtx(tenant) {
+  return {
+    cap: agentCap(tenant), count: store.agents(tenant.chatId).length, tz: tenantTz(tenant), now: new Date(),
+    tools: agentKit.availableTools(tenant, { googleOn: Boolean(google), googleConnected: Boolean(google?.isConnected(tenant.chatId)) }),
+    resolveSheet: (name) => { const r = resolveExcelFilename(tenant, name); return r.error ? { error: r.error } : { filename: r.filename }; },
+  };
+}
+async function continueAgentDraft(tenant, chatId, key, draft, text) {
+  const r = agentKit.stepDraft(draft, text, agentCtx(tenant));
+  if (r.create) {
+    agentDrafts.delete(key);
+    const rec = agentKit.newAgentRecord(r.create);
+    const added = store.addAgent(chatId, rec, agentCap(tenant));
+    if (added.error) return sendTelegramMessage(chatId, 'You already have the most agents you can have right now. Remove one first: /agent delete <number>.');
+    logEvent(tenant, { kind: 'action', action: 'agent_create', status: 'done' });
+    return sendTelegramMessage(chatId, agentKit.createdText(rec, store.agents(chatId).length - 1, tenantTz(tenant)));
+  }
+  if (r.draft) agentDrafts.set(key, { ...r.draft, createdAt: Date.now() }); else agentDrafts.delete(key);
+  return sendTelegramMessage(chatId, r.reply);
+}
+async function handleAgentCommand(tenant, chatId, arg) {
+  const say = (t) => sendTelegramMessage(chatId, t);
+  const key = String(chatId);
+  const tz = tenantTz(tenant);
+  const agents = store.agents(chatId);
+  const cap = agentCap(tenant);
+  const [sub = '', ...more] = String(arg || '').trim().split(/\s+/);
+  const verb = sub.toLowerCase();
+  const rest = more.join(' ').trim();
+  if (!verb) return say(agentKit.listText(agents, cap, tz));
+  if (['new', 'create', 'build', 'add'].includes(verb)) {
+    if (agents.length >= cap) return say(`You already have ${agents.length} agents — the most you can have right now. Remove one first: /agent delete <number>.`);
+    pendingActions.delete(key);
+    const s = agentKit.startDraft(rest, { cap, count: agents.length });
+    agentDrafts.set(key, { ...s.draft, createdAt: Date.now() });
+    return say(s.reply);
+  }
+  if (verb === 'cancel') { const had = agentDrafts.delete(key); return say(had ? 'Scrapped it. Nothing was saved.' : 'Nothing to cancel.'); }
+  if (verb === 'schedule') {
+    const m = /^(\d{1,2})\s+(.+)$/.exec(rest);
+    const a = m && agents[+m[1] - 1];
+    if (!a) return say('Which one, and when? For example: /agent schedule 1 every weekday at 8am');
+    const s = parseSchedule(m[2], { tz });
+    if (!s) return say(`I didn't catch a time. Try "every weekday at 8am", "daily at 5:30pm", "tomorrow at 9am", or "only when I ask".`);
+    store.updateAgent(chatId, a.id, { schedule: s, enabled: true, armedAt: new Date().toISOString() });
+    return say(`Done — ${a.name} will run ${describeSchedule(s, tz)}.`);
+  }
+  const known = ['run', 'pause', 'resume', 'delete', 'remove', 'show', 'info'];
+  const a = known.includes(verb) ? agentKit.findAgent(agents, rest) : agentKit.findAgent(agents, String(arg).trim());
+  if (!a) return say(agents.length ? `I don't see that agent. ${agentKit.listText(agents, cap, tz)}` : agentKit.listText(agents, cap, tz));
+  const i = agents.indexOf(a);
+  if (verb === 'run') {
+    const day = new Date().toISOString().slice(0, 10);
+    const m = manualRuns.get(key);
+    const n = m && m.day === day ? m.n : 0;
+    if (n >= MAX_MANUAL_RUNS) return say(`That's ${MAX_MANUAL_RUNS} manual runs today — enough for now. It still runs on its schedule.`);
+    manualRuns.set(key, { day, n: n + 1 });
+    return deliver(chatId, tenant, await runAction(tenant, 'agent_run', { agentId: a.id, manual: true }));
+  }
+  if (verb === 'pause') { store.updateAgent(chatId, a.id, { enabled: false }); return say(`Paused ${a.name}. Bring it back with /agent resume ${i + 1}.`); }
+  if (verb === 'resume') {
+    store.updateAgent(chatId, a.id, { enabled: true, armedAt: new Date().toISOString() });
+    return say(a.schedule?.kind === 'once' ? `${a.name} is back on, but its one-time moment has passed. Give it a new time: /agent schedule ${i + 1} tomorrow at 9am` : `${a.name} is back on — ${describeSchedule(a.schedule, tz)}.`);
+  }
+  if (verb === 'delete' || verb === 'remove') {
+    pendingActions.set(key, { action: 'agent_delete', args: { agentId: a.id }, createdAt: Date.now() });
+    return say(`Delete "${a.name}"? That can't be undone.\n\nGo ahead? (yes/no)`);
+  }
+  return say(agentKit.agentDetail(a, i, tz));
+}
+async function agentDeleteAction(tenant, args) {
+  const a = store.agents(tenant.chatId).find((x) => x.id === args.agentId);
+  if (!a) return { text: 'That agent is already gone.' };
+  store.removeAgent(tenant.chatId, a.id);
+  return { text: `Deleted "${a.name}".` };
+}
+const eventLines = (events, tz) => (events.length ? events.map((e) => {
+  const d = new Date(e.start);
+  return `• ${e.allDay ? `${d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' })} (all day)` : d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz })} — ${e.title}`;
+}).join('\n') : '(nothing)');
+// What an agent does when it runs: gather what its tools can read, have the AI write one short message. Never changes anything.
+async function agentRunAction(tenant, args) {
+  const agent = store.agents(tenant.chatId).find((a) => a.id === args.agentId);
+  if (!agent) return { text: 'That agent no longer exists.' };
+  const tz = tenantTz(tenant);
+  const now = new Date();
+  const tools = agent.tools || [];
+  const parts = [];
+  if (tools.includes('calendar')) {
+    if (!tenant.tools.includes('calendar') || !google?.isConnected(tenant.chatId)) parts.push('CALENDAR: not available (Google is not connected).');
+    else {
+      try {
+        const today = await google.listEvents(tenant.chatId, 'today', tz);
+        const tomorrow = await google.listEvents(tenant.chatId, 'tomorrow', tz);
+        parts.push(`CALENDAR — rest of today:\n${eventLines(today, tz)}\n\nCALENDAR — tomorrow:\n${eventLines(tomorrow, tz)}`);
+      } catch (err) {
+        parts.push(`CALENDAR: not available right now${err instanceof NeedsReconnect ? ' (Google needs to be reconnected)' : ''}.`);
+      }
+    }
+  }
+  if (tools.includes('notes') && tenant.tools.includes('utilities')) parts.push(`NOTES:\n${listNotes(tenant)}`);
+  if (tools.includes('sheet') && tenant.tools.includes('spreadsheets') && agent.sheet) {
+    const f = readExcelFile(tenant, agent.sheet);
+    parts.push(f.error ? `SPREADSHEET ${agent.sheet}: not available.` : `SPREADSHEET ${f.safeName}:\n${formatRowsAsText(f.rows).slice(0, 3000)}`);
+  }
+  const data = parts.join('\n\n') || '(this agent was not given any tools)';
+  const { system, user } = agentKit.buildRunPrompt({ agent, business: tenant.name, instructions: tenant.isAdmin ? '' : tenant.instructions, nowLabel: `${formatWhen(now, tz)} ${tzAbbrev(now, tz)}`, data });
+  let reply = '';
+  try {
+    const out = await callLocalModel(system, user, { role: 'chat', temperature: 0.3 });
+    reply = agentKit.cleanRunOutput(out?.reply);
+  } catch { reply = ''; }
+  if (!reply || CLAIMED_ACTION_RE.test(reply)) {
+    store.updateAgent(tenant.chatId, agent.id, { lastStatus: 'failed' });
+    return { text: `🤖 ${agent.name}: I couldn't put the message together this time (the AI didn't answer). ${args.manual ? 'Try /agent run again in a minute.' : "I'll try again at its next run."}` };
+  }
+  store.updateAgent(tenant.chatId, agent.id, { lastRunAt: now.toISOString(), lastStatus: 'ok', runs: (agent.runs || 0) + 1 });
+  return { text: `🤖 ${agent.name}\n\n${reply}` };
+}
+
+//#### COMMANDS
+    case '/agents':
+    case '/agent': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      await handleAgentCommand(tenant, chatId, cmd === '/agents' ? '' : arg);
+      return true;
+    }
+
+    case '/timezone': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      const cur = tenantTz(tenant);
+      if (!arg) {
+        await sendTelegramMessage(chatId, `Your time zone is ${cur}${tenant.tz ? '' : " (the computer's, since you haven't set one)"}. It's ${formatWhen(new Date(), cur)} there. Change it with /timezone America/Chicago — or /timezone eastern (also pacific, mountain, central, alaska, hawaii, arizona).`);
+        return true;
+      }
+      const ALIASES = { pacific: 'America/Los_Angeles', mountain: 'America/Denver', central: 'America/Chicago', eastern: 'America/New_York', alaska: 'America/Anchorage', hawaii: 'Pacific/Honolulu', arizona: 'America/Phoenix' };
+      const zone = ALIASES[arg.toLowerCase().replace(/\b(time|standard|daylight|zone)\b/g, '').trim()] || arg.trim();
+      if (!validTz(zone)) {
+        await sendTelegramMessage(chatId, "I don't know that time zone. Try /timezone eastern (or pacific, central, mountain), or a name like America/Chicago.");
+        return true;
+      }
+      store.setTimezone(chatId, zone);
+      await sendTelegramMessage(chatId, `Done — I'll use ${zone} for your calendar and agents. It's ${formatWhen(new Date(), zone)} there.`);
+      return true;
+    }
+
+//#### SCHEDULER
+// ---------------------------------------------------------------------------
+// The agent clock: every few seconds, see which agents have come due and run them, one at a time per business.
+// A run that is more than 3 hours late (the computer was off) is skipped rather than sent at a silly time.
+// ---------------------------------------------------------------------------
+async function runScheduledAgent(chatId, agentId) {
+  const tenant = store.get(chatId);
+  const agent = tenant && store.agents(chatId).find((a) => a.id === agentId);
+  if (!tenant || !agent) return;
+  let ent = null;
+  try { ent = await entitlements.get(tenant); } catch { ent = null; }
+  if (ent && !ent.canUse) { logEvent(tenant, { kind: 'blocked', action: 'agent_run', status: 'blocked', reason: 'account paused' }); return; }
+  await als.run({ tenant, ent }, async () => {
+    try {
+      const r = await runAction(tenant, 'agent_run', { agentId });
+      await sendTelegramMessage(chatId, r.text);
+    } catch (err) {
+      console.error('[agent] scheduled run failed:', err?.name || 'Error');
+      store.updateAgent(chatId, agentId, { lastStatus: 'failed' });
+      await sendTelegramMessage(chatId, `🤖 ${agent.name} couldn't run this time. I'll try again at its next run.`).catch(() => {});
+    }
+  });
+}
+let agentTicking = false;
+async function agentTick(now = new Date()) {
+  if (agentTicking) return;
+  agentTicking = true;
+  try {
+    for (const tenant of store.list()) {
+      for (const a of store.agents(tenant.chatId)) {
+        if (!a.enabled) continue;
+        const since = new Date(Math.max(Date.parse(a.lastRunAt || '') || 0, Date.parse(a.armedAt || '') || 0, Date.parse(a.createdAt || '') || 0));
+        if (!dueAt(a.schedule, { now, tz: tenantTz(tenant), since })) continue;
+        store.updateAgent(tenant.chatId, a.id, { lastRunAt: now.toISOString(), ...(a.schedule?.kind === 'once' ? { enabled: false } : {}) }); // claim it first, so a slow run can never fire twice
+        enqueue(String(tenant.chatId), () => runScheduledAgent(tenant.chatId, a.id)).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('[agent] clock check failed:', err?.message);
+  } finally { agentTicking = false; }
+}
+{
+  const every = Number(process.env.AGENT_TICK_MS) || 30000;
+  setTimeout(agentTick, Math.min(3000, every)).unref();
+  setInterval(agentTick, every).unref();
+}

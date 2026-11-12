@@ -67,7 +67,10 @@ export function createLLM({
     }
     if (!res.ok) {
       // 429 / 5xx are worth one more try; 400/401/403/404 mean this model will not work for us right now.
-      throw { retryable: res.status === 429 || res.status >= 500, message: `http ${res.status}` };
+      let detail = '';
+      try { detail = JSON.parse(await res.text())?.error?.message || ''; } catch { /* no readable reason */ }
+      detail = String(detail).replace(/gsk_[A-Za-z0-9_-]+/g, '[key]').replace(/\s+/g, ' ').slice(0, 140); // the reason helps; a key never appears
+      throw { retryable: res.status === 429 || res.status >= 500, message: `http ${res.status}${detail ? `: ${detail}` : ''}` };
     }
     let data;
     try { data = await res.json(); } catch { throw { retryable: true, message: 'bad response' }; }
@@ -99,7 +102,7 @@ export function createLLM({
           if (o.json) {
             try { data = JSON.parse(text); } catch { throw { retryable: true, message: 'invalid json' }; }
           }
-          const receipt = { role: o.role || null, tier, model: names[tier], degraded: i > 0, firstChoice: tiers[0], ms: Date.now() - t0, usage, attempts: attempts.length + 1 };
+          const receipt = { role: o.role || null, tier, model: names[tier], degraded: i > 0, firstChoice: tiers[0], ms: Date.now() - t0, usage, attempts: attempts.length + 1, failures: attempts.map((a) => `${a.tier}:${a.reason}`) };
           log(receipt);
           return { data, text, ...receipt };
         } catch (e) {

@@ -1,0 +1,10 @@
+.env
+.env.*
+node_modules/
+*.bak-*
+*.before-*
+.DS_Store
+*.log
+*.tgz
+data/
+workspaces/

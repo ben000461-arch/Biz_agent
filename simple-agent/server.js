@@ -30,7 +30,7 @@ import { fileURLToPath } from 'url';
 import XLSX from 'xlsx';
 import { createStore, ALL_TOOL_GROUPS } from './tenants.js';
 import { createVault } from './vault.js';
-import { createGoogle, NeedsReconnect } from './google.js';
+import { createGoogle, NeedsReconnect, NeedsMoreAccess } from './google.js';
 import { createGitHub, readPrivateKey } from './github.js';
 import { runCodeTask, parseCodeRequest } from './coder.js';
 import { createModelConnector, extractJson, PROVIDERS } from './models.js';
@@ -43,6 +43,12 @@ import { createEntitlements, frozenMessage, trialReminderMessage } from './entit
 import { createMeter, decide, crossing, nextReset, blockMessage, warningMessage, usageMessage, rateLimitMessage, actionCosts } from './meter.js';
 import { PLANS as PLAN_TABLE, SETTABLE_PLANS, creditCost } from './plans.js';
 import { createWebAuth, mountWebChat } from './webchat.js';
+import { mountBilling } from './billing.js';
+import { mountToolRequests } from './toolrequests.js';
+import { mountToolConn } from './toolconn.js';
+import { parseWhen, parseDuration, deriveTitle, looksLikeBooking, formatWhen, tzAbbrev, clock12, validTz, zonedParts, parseSchedule, describeSchedule, dueAt, nextRuns, localDate, startOfLocalDay, fromLocal, fixBookingTypos } from './when.js';
+import * as agentKit from './agents.js';
+import { mountWebApi } from './webapi.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -107,7 +113,7 @@ const llm = createLLM({
   log: (r) => {
     const c = als.getStore();
     if (c && !r.failed) (c.receipts ||= []).push(r); // the credit meter (next step) reads these
-    console.log(r.failed ? `[llm] failed after ${r.attempts.length} attempt(s): ${r.attempts.map((a) => `${a.tier}:${a.reason}`).join(', ')}` : `[llm] ${r.tier} (${r.model}) ${r.ms}ms${r.degraded ? ` FALLBACK from ${r.firstChoice}` : ''} tokens in/out ${r.usage?.in ?? '?'}/${r.usage?.out ?? '?'}`);
+    console.log(r.failed ? `[llm] failed after ${r.attempts.length} attempt(s): ${r.attempts.map((a) => `${a.tier}:${a.reason}`).join(', ')}` : `[llm] ${r.tier} (${r.model}) ${r.ms}ms${r.degraded ? ` FALLBACK from ${r.firstChoice} (${(r.failures || []).slice(0, 2).join('; ')})` : ''} tokens in/out ${r.usage?.in ?? '?'}/${r.usage?.out ?? '?'}`);
   },
 });
 const entitlements = createEntitlements({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
@@ -320,6 +326,7 @@ function remember(chatId, role, text) {
 function resetMemory(chatId, turns = []) {
   chatMemory.delete(String(chatId));
   pendingActions.delete(String(chatId));
+  agentDrafts.delete(String(chatId));
   for (const t of turns) remember(chatId, t.role === 'assistant' ? 'assistant' : 'user', t.text);
 }
 function recall(chatId) {
@@ -633,7 +640,7 @@ async function calendarSummary(tenant, when) {
   const w = ['today', 'tomorrow', 'week'].includes(when) ? when : 'today';
   let events;
   try {
-    events = await google.listEvents(tenant.chatId, w);
+    events = await google.listEvents(tenant.chatId, w, tenantTz(tenant));
   } catch (err) {
     if (err instanceof NeedsReconnect) return 'Your Google connection has expired — send /connect to reconnect.';
     throw err;
@@ -643,7 +650,7 @@ async function calendarSummary(tenant, when) {
   const fmt = (e) => {
     const d = new Date(e.start);
     if (e.allDay) return `${d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' })} (all day)`;
-    return d.toLocaleString('en-US', { ...(w === 'week' ? { weekday: 'short' } : {}), hour: 'numeric', minute: '2-digit' });
+    return d.toLocaleString('en-US', { ...(w === 'week' ? { weekday: 'short' } : {}), hour: 'numeric', minute: '2-digit', timeZone: tenantTz(tenant) });
   };
   return `Your calendar for ${label}:\n${events.map((e) => `• ${fmt(e)} — ${e.title}`).join('\n')}`;
 }
@@ -858,7 +865,7 @@ const ACTION_GROUP = {
   write_file: 'files',
   draft_email: 'email',
   write_excel: 'spreadsheets', view_excel: 'spreadsheets', edit_excel: 'spreadsheets',
-  list_events: 'calendar',
+  list_events: 'calendar', create_event: 'calendar',
   list_repos: 'github', list_prs: 'github', build_status: 'github', code_task: 'github',
 };
 
@@ -899,8 +906,243 @@ function limitReply(text) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Time zones, booking events on the calendar, and agents (phase 4).
+// when.js reads dates/times in plain words; agents.js is the build-an-agent questions; google.js talks to Google.
+// ---------------------------------------------------------------------------
+const SERVER_TZ = validTz(process.env.TZ) ? process.env.TZ : (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } })();
+const tenantTz = (tenant) => (validTz(tenant?.tz) ? tenant.tz : SERVER_TZ);
+const TIME_ASK = 'What time should I put it? For example: schedule a meeting with Tom tomorrow at 3pm.';
+const DAY_TIME_ASK = 'What day and time? For example: schedule a meeting with Tom tomorrow at 3pm.';
+const bookingAsks = new Map(); // chatId -> { text, at }: we asked "what day and time?" and are waiting for the answer
+// They answered our "what day and time?" with just the time (or "yes a meeting tomorrow at 3"): join it to the question it answers.
+function bookingFollowUp(key, text, tenant) {
+  const ask = bookingAsks.get(key);
+  if (!ask) return null;
+  bookingAsks.delete(key);
+  if (Date.now() - ask.at > 10 * 60000 || text.startsWith('/')) return null;
+  const rest = text.replace(/^(?:yes|yeah|yep|yup|ok|okay|and|also|so)[,.!]?\s+/i, '').trim();
+  if (/^(?:what|what's|whats|when|how|who|why|which|is|are|do|does|can|show|list|tell)\b/i.test(rest) || !parseWhen(rest, { tz: tenantTz(tenant) })) return null;
+  return looksLikeBooking(rest) ? rest : `${ask.text} ${rest}`;
+}
+// A chat reply cannot add, schedule or send anything. If the AI says it did, that is not true.
+const CLAIMED_DONE_RE = /\b(?:i(?:'ve| have)?|i'll|i will)\s+(?:just\s+|now\s+|gone ahead and\s+)?(?:added|scheduled|booked|created|put|set up|saved|sent|drafted|deleted|removed|updated|logged)\b[^.?!]{0,100}\b(?:calendar|event|meeting|appointment|invite|email|draft|spreadsheet|sheet|note|file|reminder)\b|\b(?:has|have) been (?:added|scheduled|booked|created|saved|sent)\b/i;
+
+// Is this message an order to put something on the calendar? Code decides, from their own words — the AI only
+// helps with the title. Fills in the start/end/title, or says what's missing.
+function vetBooking(tenant, text, parsed) {
+  text = fixBookingTypos(text);
+  const booking = looksLikeBooking(text);
+  const a = parsed.action;
+  if (!booking) {
+    if (a === 'create_event') { // the AI picked "add to calendar" but they only asked about their schedule
+      if (/\b(calendar|schedule|agenda|meetings?|appointments?|events?)\b/i.test(text)) { parsed.action = 'list_events'; parsed.when = /\btomorrow\b/i.test(text) ? 'tomorrow' : /\bweek\b/i.test(text) ? 'week' : 'today'; }
+      else parsed.action = 'chat';
+    }
+    return null;
+  }
+  if (a && !['list_events', 'chat', 'create_event', 'add_note', 'write_file'].includes(a)) return null; // a spreadsheet or email request keeps its own route
+  parsed.action = 'create_event';
+  const tz = tenantTz(tenant);
+  const w = parseWhen(text, { tz });
+  if (!w) return { reply: DAY_TIME_ASK };
+  if (!w.hasTime) return { reply: TIME_ASK };
+  if (w.past) return { reply: 'That time has already passed today. Did you mean tomorrow? Try: schedule a meeting with Tom tomorrow at 3pm.' };
+  const dur = parseDuration(text) || 60;
+  parsed.startISO = w.start.toISOString();
+  parsed.endISO = new Date(w.start.getTime() + dur * 60000).toISOString();
+  parsed.vague = w.vague; parsed.rolled = w.rolled; parsed.tz = tz;
+  const words = new Set(String(text).toLowerCase().match(/[a-z]{3,}/g) || []);
+  const t = typeof parsed.title === 'string' ? parsed.title.replace(/\s+/g, ' ').trim() : '';
+  const grounded = t && t.length <= 80 && !/^(null|none|n\/a|undefined)$/i.test(t) && (t.toLowerCase().match(/[a-z]{3,}/g) || []).some((x) => words.has(x));
+  parsed.title = grounded ? t : deriveTitle(text);
+  return null;
+}
+
+// The "I'll add this — OK?" message. Returns text; sets args.confirmOk only when there is really something to confirm.
+async function confirmEventPrompt(tenant, args) {
+  if (!google) return "Calendar isn't set up on this server yet.";
+  if (!google.isConnected(tenant.chatId)) return "Your calendar isn't connected yet — send /connect to link your Google account, then ask again.";
+  const tz = args.tz || tenantTz(tenant);
+  const start = new Date(args.startISO), end = new Date(args.endISO);
+  let clash = [];
+  try {
+    clash = (await google.eventsBetween(tenant.chatId, args.startISO, args.endISO)).filter((e) => !e.allDay).slice(0, 3);
+  } catch (err) {
+    if (err instanceof NeedsReconnect) return 'Your Google connection has expired — send /connect to reconnect, then ask again.';
+    // can't check for clashes right now: still fine to ask
+  }
+  args.confirmOk = true;
+  const sp = zonedParts(start, tz), ep = zonedParts(end, tz);
+  const mins = Math.round((end - start) / 60000);
+  const dur = mins % 60 === 0 ? `${mins / 60} hour${mins === 60 ? '' : 's'}` : mins > 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`;
+  let msg = `I'll add this to your Google Calendar:\n\n📅 ${args.title}\n🕒 ${formatWhen(start, tz)} – ${clock12(ep.h, ep.mi)} ${tzAbbrev(start, tz)} (${dur})`;
+  if (clash.length) msg += `\n⚠️ Heads up — you already have ${clash.map((e) => { const p = zonedParts(new Date(e.start), tz); return `"${e.title}" at ${clock12(p.h, p.mi)}`; }).join(' and ')} then.`;
+  if (args.vague) msg += `\n(You didn't say AM or PM, so I guessed ${clock12(sp.h, sp.mi)}.)`;
+  if (args.rolled) msg += `\n(That time has already passed, so I used the next one.)`;
+  return `${msg}\n\nAdd it? (yes/no)`;
+}
+
+// Runs only after the owner said yes.
+async function createEventAction(tenant, args) {
+  if (!google?.isConnected(tenant.chatId)) return { text: "Your calendar isn't connected yet — send /connect to link your Google account." };
+  const tz = args.tz || tenantTz(tenant);
+  try {
+    await google.createEvent(tenant.chatId, { title: args.title, startISO: args.startISO, endISO: args.endISO, tz });
+  } catch (err) {
+    if (err instanceof NeedsMoreAccess) return { text: 'To add events I need a bit more permission than you gave me before. Send /connect google, approve it again, then say it again. Nothing was added.' };
+    if (err instanceof NeedsReconnect) return { text: 'Your Google connection has expired — send /connect to reconnect, then ask again. Nothing was added.' };
+    console.warn('[calendar] add failed:', err?.message);
+    return { text: "I couldn't add it to your calendar just now, so nothing was added. Try again in a minute." };
+  }
+  const ep = zonedParts(new Date(args.endISO), tz);
+  return { text: `Added to your calendar ✅\n📅 ${args.title}\n🕒 ${formatWhen(new Date(args.startISO), tz)} – ${clock12(ep.h, ep.mi)}` };
+}
+
+// ---- agents ----
+const agentDrafts = new Map(); // chatId -> where they are in the build-an-agent questions
+const manualRuns = new Map(); // chatId -> { day, n } so "run it now" can't be spammed
+const MAX_MANUAL_RUNS = Number(process.env.AGENT_MANUAL_RUNS_PER_DAY) || 10;
+const agentCap = (tenant) => Math.min(10, Math.max(1, Number(tenant?.agentCap) || Number(process.env.MAX_AGENTS) || agentKit.DEFAULT_MAX_AGENTS));
+function agentCtx(tenant) {
+  return {
+    cap: agentCap(tenant), count: store.agents(tenant.chatId).length, tz: tenantTz(tenant), now: new Date(),
+    tools: agentKit.availableTools(tenant, { googleOn: Boolean(google), googleConnected: Boolean(google?.isConnected(tenant.chatId)) }),
+    resolveSheet: (name) => { const r = resolveExcelFilename(tenant, name); return r.error ? { error: r.error } : { filename: r.filename }; },
+  };
+}
+async function continueAgentDraft(tenant, chatId, key, draft, text) {
+  const r = agentKit.stepDraft(draft, text, agentCtx(tenant));
+  if (r.create) {
+    agentDrafts.delete(key);
+    const rec = agentKit.newAgentRecord(r.create);
+    const added = store.addAgent(chatId, rec, agentCap(tenant));
+    if (added.error) return sendTelegramMessage(chatId, 'You already have the most agents you can have right now. Remove one first: /agent delete <number>.');
+    logEvent(tenant, { kind: 'action', action: 'agent_create', status: 'done' });
+    return sendTelegramMessage(chatId, agentKit.createdText(rec, store.agents(chatId).length - 1, tenantTz(tenant)));
+  }
+  if (r.draft) agentDrafts.set(key, { ...r.draft, createdAt: Date.now() }); else agentDrafts.delete(key);
+  return sendTelegramMessage(chatId, r.reply);
+}
+async function handleAgentCommand(tenant, chatId, arg) {
+  const say = (t) => sendTelegramMessage(chatId, t);
+  const key = String(chatId);
+  const tz = tenantTz(tenant);
+  const agents = store.agents(chatId);
+  const cap = agentCap(tenant);
+  const [sub = '', ...more] = String(arg || '').trim().split(/\s+/);
+  const verb = sub.toLowerCase();
+  const rest = more.join(' ').trim();
+  if (!verb) return say(agentKit.listText(agents, cap, tz));
+  if (['new', 'create', 'build', 'add'].includes(verb)) {
+    if (agents.length >= cap) return say(`You already have ${agents.length} agents — the most you can have right now. Remove one first: /agent delete <number>.`);
+    pendingActions.delete(key);
+    const s = agentKit.startDraft(rest, { cap, count: agents.length });
+    agentDrafts.set(key, { ...s.draft, createdAt: Date.now() });
+    return say(s.reply);
+  }
+  if (verb === 'cancel') { const had = agentDrafts.delete(key); return say(had ? 'Scrapped it. Nothing was saved.' : 'Nothing to cancel.'); }
+  if (verb === 'schedule') {
+    const m = /^(\d{1,2})\s+(.+)$/.exec(rest);
+    const a = m && agents[+m[1] - 1];
+    if (!a) return say('Which one, and when? For example: /agent schedule 1 every weekday at 8am');
+    const s = parseSchedule(m[2], { tz });
+    if (!s) return say(`I didn't catch a time. Try "every weekday at 8am", "daily at 5:30pm", "tomorrow at 9am", or "only when I ask".`);
+    if (s.kind === 'before_event' && !google?.isConnected(chatId)) return say('Running before your meetings needs your calendar. Send /connect google first.');
+    store.updateAgent(chatId, a.id, { schedule: s, enabled: true, armedAt: new Date().toISOString(), briefed: {} });
+    return say(`Done — ${a.name} will run ${describeSchedule(s, tz)}.`);
+  }
+  const known = ['run', 'pause', 'resume', 'delete', 'remove', 'show', 'info'];
+  const a = known.includes(verb) ? agentKit.findAgent(agents, rest) : agentKit.findAgent(agents, String(arg).trim());
+  if (!a) return say(agents.length ? `I don't see that agent. ${agentKit.listText(agents, cap, tz)}` : agentKit.listText(agents, cap, tz));
+  const i = agents.indexOf(a);
+  if (verb === 'run') {
+    const day = new Date().toISOString().slice(0, 10);
+    const m = manualRuns.get(key);
+    const n = m && m.day === day ? m.n : 0;
+    if (n >= MAX_MANUAL_RUNS) return say(`That's ${MAX_MANUAL_RUNS} manual runs today — enough for now. It still runs on its schedule.`);
+    manualRuns.set(key, { day, n: n + 1 });
+    return deliver(chatId, tenant, await runAction(tenant, 'agent_run', { agentId: a.id, manual: true }));
+  }
+  if (verb === 'pause') { store.updateAgent(chatId, a.id, { enabled: false }); return say(`Paused ${a.name}. Bring it back with /agent resume ${i + 1}.`); }
+  if (verb === 'resume') {
+    store.updateAgent(chatId, a.id, { enabled: true, armedAt: new Date().toISOString() });
+    return say(a.schedule?.kind === 'once' ? `${a.name} is back on, but its one-time moment has passed. Give it a new time: /agent schedule ${i + 1} tomorrow at 9am` : `${a.name} is back on — ${describeSchedule(a.schedule, tz)}.`);
+  }
+  if (verb === 'delete' || verb === 'remove') {
+    pendingActions.set(key, { action: 'agent_delete', args: { agentId: a.id }, createdAt: Date.now() });
+    return say(`Delete "${a.name}"? That can't be undone.\n\nGo ahead? (yes/no)`);
+  }
+  return say(agentKit.agentDetail(a, i, tz));
+}
+async function agentDeleteAction(tenant, args) {
+  const a = store.agents(tenant.chatId).find((x) => x.id === args.agentId);
+  if (!a) return { text: 'That agent is already gone.' };
+  store.removeAgent(tenant.chatId, a.id);
+  return { text: `Deleted "${a.name}".` };
+}
+const eventLines = (events, tz) => (events.length ? events.map((e) => {
+  const d = new Date(e.start);
+  return `• ${e.allDay ? `${d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' })} (all day)` : d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz })} — ${e.title}`;
+}).join('\n') : '(nothing)');
+// What an agent does when it runs: gather what its tools can read, have the AI write one short message. Never changes anything.
+async function agentRunAction(tenant, args) {
+  const agent = store.agents(tenant.chatId).find((a) => a.id === args.agentId);
+  if (!agent) return { text: 'That agent no longer exists.' };
+  const tz = tenantTz(tenant);
+  const now = new Date();
+  const tools = agent.tools || [];
+  const parts = [];
+  let ev = args.event || null;
+  if (agent.schedule?.kind === 'before_event' && !ev) { // "run it now": practise on the next real meeting
+    try {
+      const soon = (await google.eventsBetween(tenant.chatId, now.toISOString(), new Date(now.getTime() + 24 * 3600e3).toISOString())).filter((e) => !e.allDay);
+      ev = soon[0] ? { title: soon[0].title, start: soon[0].start } : null;
+    } catch { ev = null; }
+    if (!ev) return { text: `🤖 ${agent.name}: I don't see a meeting in the next 24 hours to practise on. It will run ${describeSchedule(agent.schedule, tz)} once you have one.` };
+  }
+  if (ev) {
+    const p = zonedParts(new Date(ev.start), tz);
+    const mins = Math.round((Date.parse(ev.start) - now.getTime()) / 60000);
+    parts.push(`THE MEETING THIS MESSAGE IS ABOUT:\n• ${clock12(p.h, p.mi)} — ${ev.title}${mins > 0 ? ` (starts in ${mins} minutes)` : ''}`);
+  }
+  if (tools.includes('calendar')) {
+    if (!tenant.tools.includes('calendar') || !google?.isConnected(tenant.chatId)) parts.push('CALENDAR: not available (Google is not connected).');
+    else {
+      try {
+        const today = await google.listEvents(tenant.chatId, 'today', tz);
+        const tomorrow = await google.listEvents(tenant.chatId, 'tomorrow', tz);
+        parts.push(`CALENDAR — rest of today:\n${eventLines(today, tz)}\n\nCALENDAR — tomorrow:\n${eventLines(tomorrow, tz)}`);
+      } catch (err) {
+        parts.push(`CALENDAR: not available right now${err instanceof NeedsReconnect ? ' (Google needs to be reconnected)' : ''}.`);
+      }
+    }
+  }
+  if (tools.includes('notes') && tenant.tools.includes('utilities')) parts.push(`NOTES:\n${listNotes(tenant)}`);
+  if (tools.includes('sheet') && tenant.tools.includes('spreadsheets') && agent.sheet) {
+    const f = readExcelFile(tenant, agent.sheet);
+    parts.push(f.error ? `SPREADSHEET ${agent.sheet}: not available.` : `SPREADSHEET ${f.safeName}:\n${formatRowsAsText(f.rows).slice(0, 3000)}`);
+  }
+  const data = parts.join('\n\n') || '(this agent was not given any tools)';
+  const { system, user } = agentKit.buildRunPrompt({ agent, business: tenant.name, instructions: tenant.isAdmin ? '' : tenant.instructions, nowLabel: `${formatWhen(now, tz)} ${tzAbbrev(now, tz)}`, data });
+  let reply = '';
+  try {
+    const out = await callLocalModel(system, user, { role: 'chat', temperature: 0.3 });
+    reply = agentKit.cleanRunOutput(out?.reply);
+  } catch { reply = ''; }
+  if (!reply || CLAIMED_ACTION_RE.test(reply)) {
+    store.updateAgent(tenant.chatId, agent.id, { lastStatus: 'failed' });
+    return { text: `🤖 ${agent.name}: I couldn't put the message together this time (the AI didn't answer). ${args.manual ? 'Try /agent run again in a minute.' : "I'll try again at its next run."}` };
+  }
+  store.updateAgent(tenant.chatId, agent.id, { lastRunAt: now.toISOString(), lastStatus: 'ok', runs: (agent.runs || 0) + 1 });
+  return { text: `🤖 ${agent.name}\n\n${reply}` };
+}
+
+
 // null = fine to go ahead; { reply } = say this instead; { chat: true } = just talk.
 function vetRoute(tenant, text, parsed) {
+  const booked = vetBooking(tenant, text, parsed);
+  if (booked) return booked;
   const action = parsed.action;
   if (!action || action === 'chat') return null;
   if (action === 'add' && !/\b(add|plus|sum|total|and|together)\b|\+/i.test(text)) return { chat: true }; // the router only knows add/multiply — it must not turn "minus" into "plus"
@@ -951,10 +1193,11 @@ async function interpretCommand(tenant, text) {
 - "view_excel": the message asks to SEE, SHOW, LIST, or CHECK the contents of an existing spreadsheet, with NO change being requested — "what's in my inventory", "show me the budget sheet", "what does X look like". Extract "filename" as whatever name/hint they used — it does NOT need to be exact or include an extension (e.g. just "inventory" is fine), a matching step handles the rest.
 - "edit_excel": the message asks to CHANGE, UPDATE, or ADD TO an EXISTING spreadsheet — this includes "add X to [filename]" style requests, where X is a new row/item being added to an existing file. Extract "filename" as whatever name/hint they used — it does NOT need to be exact or include an extension.
 - "list_events": the message asks what's on their calendar, schedule, or meetings. Extract "when": "today", "tomorrow", or "week" (default "today").
+- "create_event": the message asks to schedule, book or add a meeting, appointment or event to the calendar. Extract "title" (a short name for it, in the person's own words). Do not work out the date or time.
 ${ghLines}- "chat": anything else — a greeting, small talk, a question about you, opinions, or a request you can't do with the actions above. Use "chat" whenever nothing else clearly fits. No other fields needed.
 Rule: if a filename ending in ".xlsx" (or the message otherwise clearly refers to an existing spreadsheet) appears anywhere in the message, ALWAYS choose "edit_excel", never "write_file" and never "write_excel".
 Rule: if the word "file" appears with a ".txt" name, or a plain text document is described with no spreadsheet mentioned, choose "write_file", never "add_note".
-Respond ONLY with valid JSON: {"action": "add"|"multiply"|"weather"|"add_note"|"list_notes"|"write_file"|"draft_email"|"write_excel"|"view_excel"|"edit_excel"|"list_events"${gh ? '|"list_repos"|"list_prs"|"build_status"|"code_task"' : ''}|"chat", "a": number|null, "b": number|null, "location": string|null, "note": string|null, "filename": string|null, "file_content": string|null, "recipient": string|null, "email_subject": string|null, "email_body": string|null, "sheet_rows": array|null, "when": string|null${gh ? ', "repo": string|null, "task": string|null' : ''}}`;
+Respond ONLY with valid JSON: {"action": "add"|"multiply"|"weather"|"add_note"|"list_notes"|"write_file"|"draft_email"|"write_excel"|"view_excel"|"edit_excel"|"list_events"|"create_event"${gh ? '|"list_repos"|"list_prs"|"build_status"|"code_task"' : ''}|"chat", "a": number|null, "b": number|null, "location": string|null, "note": string|null, "filename": string|null, "file_content": string|null, "recipient": string|null, "email_subject": string|null, "email_body": string|null, "sheet_rows": array|null, "when": string|null, "title": string|null${gh ? ', "repo": string|null, "task": string|null' : ''}}`;
 
   return callLocalModel(systemPrompt, text);
 }
@@ -970,8 +1213,9 @@ function capabilityList(tenant) {
   if (has('email')) out.push('draft emails (saved to Gmail drafts, never sent)');
   if (has('spreadsheets')) out.push('create, show and update spreadsheets');
   if (has('files')) out.push('save text files');
-  if (has('calendar') && google) out.push('check your calendar');
+  if (has('calendar') && google) out.push('check your calendar and add events you approve');
   if (has('utilities')) out.push('keep notes, do quick math, check the weather');
+  out.push('build agents that run on a schedule and message you (send /agents)');
   if (github?.isConnected(tenant.chatId) && has('github')) out.push('look at your GitHub projects and make code changes (shown first, pushed as a pull request only if you say yes)');
   return out;
 }
@@ -1007,7 +1251,7 @@ HOW TO REPLY
 - Be brief: one or two sentences, never more, and no lists or tutorials — EXCEPT when they ask for code or a how-to: then give a complete answer, and put every piece of code in a fenced block that names the language and puts each line of code on its own line (for example \`\`\`python on its own line, the code, then \`\`\` on its own line). No filler questions like "how can I help you today?"; ask a question only when you need the answer to help.
 - Use the conversation so far. When they refer to something said earlier, answer from it. Never claim you didn't say something you did, and never contradict yourself.
 - If they ask for something your tools do, tell them to just ask in plain words, with one example.
-- Never say you've sent, saved, pushed, connected, reconnected or linked anything, or that you are waiting for a confirmation — a chat reply can't do any of that. To connect or reconnect Google, GitHub or an AI key, the person types: connect. To push code they send /changes.
+- Never say you've sent, saved, added, scheduled, booked, pushed, connected, reconnected or linked anything, or that you are waiting for a confirmation — a chat reply can't do any of that. To connect or reconnect Google, GitHub or an AI key, the person types: connect. To push code they send /changes.
 Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
   try {
     const history = recall(tenant.chatId);
@@ -1015,6 +1259,7 @@ Respond ONLY with valid JSON: {"reply": "<your reply>"}`;
     const out = await callLocalModel(systemPrompt, userText, { role: 'chat', history, temperature: 0.5 });
     const r = typeof out?.reply === 'string' ? out.reply.trim() : '';
     if (r && CLAIMED_ACTION_RE.test(r)) return 'I can\'t connect or change accounts just by chatting. Say "connect" and I\'ll give you the secure links.';
+    if (r && CLAIMED_DONE_RE.test(r)) return 'I haven\'t added or sent anything. To put something on your calendar, say it like: schedule lunch with Dana tomorrow at 3pm. I\'ll show you what I\'ll add and wait for your yes.';
     return r ? trimChatReply(r) : null;
   } catch (err) {
     console.error('chatReply failed:', err.message);
@@ -1228,7 +1473,7 @@ async function helperReply(tenant, question) {
     return `Send /connect to link ${[s.githubOn && !s.githubConnected && 'GitHub', s.googleOn && !s.googleConnected && 'Google'].filter(Boolean).join(' and ') || 'an account'}; /connections shows what's linked.`;
   }
   if (topic === 'model') return `Coding is done by ${s.codingAi}. /model lets you pick another. Never paste a key in chat — /connect model opens a private page.`;
-  if (topic === 'calendar') return !s.googleOn ? "Calendar isn't switched on for your account." : s.googleConnected ? 'Ask like "what\'s on my calendar today?" or "…tomorrow?".' : 'Send /connect google first, then ask "what\'s on my calendar today?".';
+  if (topic === 'calendar') return !s.googleOn ? "Calendar isn't switched on for your account." : s.googleConnected ? 'Ask like "what\'s on my calendar today?" or "…tomorrow?" — or say "schedule a meeting with Tom tomorrow at 3pm" and I\'ll ask before adding it.' : 'Send /connect google first, then ask "what\'s on my calendar today?".';
   if (topic === 'notes') return 'Say "add a note: call the vet" to save one, or "show my notes" to see them.';
   if (topic === 'file') return s.hasFiles ? 'Say what to put in it: "make a file called todo.txt that says pick up milk". I show it to you before saving.' : "Text files aren't switched on for your account.";
   if (topic === 'sheet') return s.hasSheets ? 'What is it for? Say it like: "make a spreadsheet of my expenses", "show my inventory" or "add oranges to inventory". I show you before changing a file.' : "Spreadsheets aren't switched on for your account.";
@@ -1271,6 +1516,9 @@ async function executeAction(tenant, action, args) {
   if (action === 'add_note' && note) return { text: addNote(tenant, note) };
   if (action === 'list_notes') return { text: listNotes(tenant) };
   if (action === 'disconnect') return { text: await doDisconnect(tenant, args.provider) };
+  if (action === 'create_event') return createEventAction(tenant, args);
+  if (action === 'agent_run') return agentRunAction(tenant, args);
+  if (action === 'agent_delete') return agentDeleteAction(tenant, args);
   if (action === 'list_events') return { text: await calendarSummary(tenant, when) };
   if (['list_repos', 'list_prs', 'build_status'].includes(action)) return { text: await githubReply(tenant, action, repo) };
   if (action === 'push_change') return pushChangeAction(tenant, args.proposal);
@@ -1317,7 +1565,7 @@ async function executeAction(tenant, action, args) {
 }
 
 // Actions that write to disk / could overwrite real data ask first.
-const NEEDS_CONFIRMATION = new Set(['write_file', 'write_excel', 'edit_excel']);
+const NEEDS_CONFIRMATION = new Set(['write_file', 'write_excel', 'edit_excel', 'create_event']);
 
 async function buildConfirmationPrompt(tenant, action, args) {
   const ws = workspaceFor(tenant);
@@ -1339,6 +1587,7 @@ async function buildConfirmationPrompt(tenant, action, args) {
     args.updatedRows = updatedRows; // stash so confirming doesn't redo the model call
     return `Here's what I'll change in "${found.safeName}":\n\n${summarizeExcelDiff(found.rows, updatedRows)}\n\nGo ahead? (yes/no)`;
   }
+  if (action === 'create_event') return confirmEventPrompt(tenant, args);
   return null;
 }
 
@@ -1352,9 +1601,10 @@ function helpText(tenant) {
   if (has('email')) lines.push('• Draft emails — "draft an email to John about Friday"');
   if (has('spreadsheets')) lines.push('• Spreadsheets — "make a spreadsheet of my expenses", "show my inventory", "add oranges to inventory"');
   if (has('files')) lines.push('• Text files — "make a file called todo.txt that says pick up milk"');
-  if (has('calendar') && google) lines.push('• Calendar — "what\'s on my calendar today?"');
+  if (has('calendar') && google) lines.push('• Calendar — "what\'s on my calendar today?", "schedule a meeting with Tom tomorrow at 3pm"');
   if (lines.length === 1) return "Nothing is switched on for your account yet — ask the person who set you up.";
   lines.push("I'll always check with you before changing a file.");
+  lines.push('• Agents — "build an agent" sets up a helper that runs on a schedule and texts you (/agents)');
   if (github?.isConnected(tenant.chatId) && has('github')) lines.push('• GitHub — "what pull requests are open?", "is the build passing?"', '• Code — "/code in myapp, fix the crash in server.js" (I show you the change, and only push it as a pull request if you say yes; /changes lists saved ones)');
   if (aiModel && github?.isConnected(tenant.chatId) && has('github')) lines.push('Send /model to choose which AI does the coding.');
   if (google || github || aiModel) lines.push("Send /connect to link your accounts, and /connections to see what's linked.");
@@ -1656,6 +1906,32 @@ async function handleCommand({ chatId, text, isAdmin }) {
       return true;
     }
 
+    case '/agents':
+    case '/agent': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      await handleAgentCommand(tenant, chatId, cmd === '/agents' ? '' : arg);
+      return true;
+    }
+
+    case '/timezone': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      const cur = tenantTz(tenant);
+      if (!arg) {
+        await sendTelegramMessage(chatId, `Your time zone is ${cur}${tenant.tz ? '' : " (the computer's, since you haven't set one)"}. It's ${formatWhen(new Date(), cur)} there. Change it with /timezone America/Chicago — or /timezone eastern (also pacific, mountain, central, alaska, hawaii, arizona).`);
+        return true;
+      }
+      const ALIASES = { pacific: 'America/Los_Angeles', mountain: 'America/Denver', central: 'America/Chicago', eastern: 'America/New_York', alaska: 'America/Anchorage', hawaii: 'Pacific/Honolulu', arizona: 'America/Phoenix' };
+      const zone = ALIASES[arg.toLowerCase().replace(/\b(time|standard|daylight|zone)\b/g, '').trim()] || arg.trim();
+      if (!validTz(zone)) {
+        await sendTelegramMessage(chatId, "I don't know that time zone. Try /timezone eastern (or pacific, central, mountain), or a name like America/Chicago.");
+        return true;
+      }
+      store.setTimezone(chatId, zone);
+      await sendTelegramMessage(chatId, `Done — I'll use ${zone} for your calendar and agents. It's ${formatWhen(new Date(), zone)} there.`);
+      return true;
+    }
+
+
     case '/instructions': {
       if (!tenant) {
         await sendTelegramMessage(chatId, INVITE_ONLY_MSG);
@@ -1687,7 +1963,7 @@ async function handleCommand({ chatId, text, isAdmin }) {
       }
       const parts = [];
       if (google && (!want || want === 'google')) {
-        parts.push(`Google (Gmail + Calendar) — I can only save email drafts and read your calendar, and I never send email on my own. Google's screen words the Gmail permission as "manage drafts and send emails"; that is the narrowest it offers.\n${google.startSignIn(chatId)}`);
+        parts.push(`Google (Gmail + Calendar) — I can save email drafts and add calendar events, only after you say yes in chat, and I never send email on my own. Google's screen words these as "manage drafts and send emails" and "view and edit events on all your calendars"; those are the narrowest permissions it offers.\n${google.startSignIn(chatId)}`);
       }
       if (github && (!want || want === 'github')) {
         parts.push(`GitHub — you choose exactly which projects I can see on the next screen; pick only the ones you want. I can look (open pull requests, build status, code) and, only after you say yes in chat, put a change on a new branch as a pull request — never straight onto your main branch. GitHub's screen will say read and write.\n${github.startInstall(chatId)}`);
@@ -1951,6 +2227,12 @@ async function handleMessageInner(message) {
 
   const isAdmin = Boolean(ADMIN_ID) && String(fromId) === ADMIN_ID;
 
+  // Owner-only tool request commands (/tool_requests, /tool_approve_N, /tool_deny_N, /tool_ready_N)
+  if (isAdmin && /^\/tool_/i.test(text) && typeof toolReq !== 'undefined') {
+    const reply = await toolReq.adminCommand(text, fromId);
+    if (reply) return sendTelegramMessage(chatId, reply);
+  }
+
   // A message with a secret in it is never read by a model or acted on.
   if (store.get(chatId) && SECRET_RE.test(text)) return sendTelegramMessage(chatId, SECRET_MSG);
   // anything else you send closes an open yes/no — except asking for help, which must not lose it
@@ -1962,6 +2244,19 @@ async function handleMessageInner(message) {
 
   const tenant = store.get(chatId);
   if (!tenant) return handleStranger(chatId, message);
+
+  // Halfway through "build an agent"? Their next plain message answers the question we asked.
+  const draft = agentDrafts.get(key);
+  if (draft && !text.startsWith('/')) {
+    if (Date.now() - draft.createdAt > agentKit.DRAFT_TTL_MS) agentDrafts.delete(key);
+    else {
+      try { return await continueAgentDraft(tenant, chatId, key, draft, text); } catch (err) {
+        console.error('[agent] builder failed:', err?.name || 'Error');
+        agentDrafts.delete(key);
+        return await sendTelegramMessage(chatId, 'Something went wrong on my end, so I scrapped that agent. Say "build an agent" to start again.');
+      }
+    }
+  }
 
   if (!text.startsWith('/')) remember(chatId, 'user', text);
   try {
@@ -2008,6 +2303,12 @@ async function handleMessageInner(message) {
       return await sendTelegramMessage(chatId, "I can't push from a plain message, and nothing is waiting for a yes right now. I only push right after I show you a change (I ask \"Want me to push this?\"), or from /changes, where you pick a saved change to push.");
     }
 
+    const agentAsk = agentKit.agentsIntent(text);
+    if (agentAsk && (await handleCommand({ chatId, text: agentAsk, isAdmin }))) {
+      logEvent(tenant, { kind: 'command', action: '/agent', status: 'done' });
+      return;
+    }
+
     const asked = connectionsIntent(text);
     if (asked && (await handleCommand({ chatId, text: asked, isAdmin }))) {
       logEvent(tenant, { kind: 'command', action: asked.split(' ')[0], status: 'done' });
@@ -2023,9 +2324,11 @@ async function handleMessageInner(message) {
     const limit = limitReply(text);
     if (limit) { logEvent(tenant, { kind: 'chat', action: 'limit', status: 'blocked', reason: 'asked for something this agent cannot do' }); return await sendTelegramMessage(chatId, limit); }
 
-    const parsed = FOLLOWUP_RE.test(text) && !DO_VERB_RE.test(text) ? { action: 'chat' } : await interpretCommand(tenant, text);
+    const followUp = bookingFollowUp(key, text, tenant);
+    const bt = followUp || text; // what the booking check reads (a follow-up is joined to the question it answers)
+    const parsed = followUp ? { action: 'create_event', title: null } : FOLLOWUP_RE.test(text) && !DO_VERB_RE.test(text) ? { action: 'chat' } : looksLikeBooking(text) ? { action: 'create_event', title: null } : await interpretCommand(tenant, text);
     let { action } = parsed;
-    parsed.userText = text;
+    parsed.userText = bt;
     // Small models sometimes write the word "null"/"none" instead of a real null.
     for (const k of ['repo', 'when', 'recipient', 'filename', 'location', 'task']) {
       if (typeof parsed[k] === 'string' && /^(null|none|n\/a|undefined|nil|)$/i.test(parsed[k].trim())) parsed[k] = null;
@@ -2034,14 +2337,17 @@ async function handleMessageInner(message) {
 
     // Does what they actually wrote support what the model picked? If not, don't act on a hunch.
     const proposed = parsed.action;
-    const veto = vetRoute(tenant, text, parsed);
+    const veto = vetRoute(tenant, bt, parsed);
     if (veto?.reply) {
       logEvent(tenant, { kind: 'blocked', action: 'ask', status: 'blocked', proposed, reason: 'what was written did not support it; asked for details' });
+      if (parsed.action === 'create_event' && (veto.reply === DAY_TIME_ASK || veto.reply === TIME_ASK)) bookingAsks.set(key, { text: bt, at: Date.now() });
       return await sendTelegramMessage(chatId, veto.reply);
     }
     if (veto?.chat) {
       logEvent(tenant, { kind: 'blocked', action: 'chat', status: 'blocked', proposed, reason: 'what was written did not support it; treated as conversation' });
       parsed.action = 'chat'; action = 'chat';
+    } else if (parsed.action !== action) {
+      action = parsed.action; // the booking check may have changed the route
     }
 
     // Is this tool switched on for this business?
@@ -2055,7 +2361,8 @@ async function handleMessageInner(message) {
       const hasEnoughInfo =
         (action === 'write_file' && parsed.file_content) ||
         (action === 'write_excel' && parsed.sheet_rows?.length > 0) ||
-        (action === 'edit_excel' && parsed.filename);
+        (action === 'edit_excel' && parsed.filename) ||
+        (action === 'create_event' && parsed.startISO);
 
       if (hasEnoughInfo) {
         if (action === 'edit_excel') {
@@ -2068,10 +2375,12 @@ async function handleMessageInner(message) {
         if (confirmationMsg) {
           // edit_excel returns a plain error string when the file can't be
           // read — only keep a pending action when there's something to confirm.
-          if (action !== 'edit_excel' || args.updatedRows) {
+          if (action === 'create_event' ? args.confirmOk : (action !== 'edit_excel' || args.updatedRows)) {
             pendingActions.set(key, { action, args, createdAt: Date.now() });
           }
-          logEvent(tenant, { kind: 'action', action, status: 'asked', detail: detailOf(parsed) });
+          logEvent(tenant, action === 'create_event' && !args.confirmOk
+            ? { kind: 'blocked', action, status: 'blocked', reason: 'calendar not ready' }
+            : { kind: 'action', action, status: 'asked', detail: detailOf(parsed) });
           return await sendTelegramMessage(chatId, confirmationMsg);
         }
       }
@@ -2129,6 +2438,10 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 // The website's chat box. Same engine as Telegram; the answer goes back to the page instead.
 // Only the website's own address may call it (SITE_URL, plus WEB_ORIGINS if you list more, comma-separated).
 const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+mountBilling(app, { auth: webAuth, entitlements, getTenant: (chatId) => store.get(chatId), supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, log: console.log, notify: (text) => (ADMIN_ID ? sendTelegramMessage(ADMIN_ID, '💳 ' + text) : null) });
+const toolReq = mountToolRequests(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, adminId: ADMIN_ID, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), describeChat: (chatId) => store.get(chatId)?.name || store.get(chatId)?.business || '', log: console.log });
+const toolConn = mountToolConn(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), log: console.log });
+console.log('Tool connections: ' + (toolConn.enabled ? 'on' : 'off (set TOOLCONN_KEY)'));
 mountWebChat(app, {
   express,
   auth: webAuth,
@@ -2147,6 +2460,151 @@ mountWebChat(app, {
   log: (line) => console.log(line),
 });
 console.log(`Website chat: ${webAuth.enabled ? 'on (POST /web/chat)' : 'OFF (needs the Supabase settings)'}.`);
+// ---------------------------------------------------------------------------
+// What the website's Schedule and Agents tabs can do. The doors themselves (login check, address check, limits)
+// are in webapi.js; this is what each one does. Pressing a button on the website is the owner's "yes".
+// ---------------------------------------------------------------------------
+async function entFor(tenant) { try { return await entitlements.get(tenant); } catch { return null; } }
+const pausedBody = (ent) => ({ status: 402, body: { error: 'paused', message: frozenMessage(ent, { siteUrl: String(SITE_URL).replace(/\/?$/, '/') }) } });
+const publicAgent = (a, tz) => ({
+  id: a.id, name: a.name, purpose: a.purpose, info: a.info || '', tools: a.tools || [], sheet: a.sheet || null,
+  schedule: a.schedule, scheduleText: describeSchedule(a.schedule, tz), enabled: Boolean(a.enabled),
+  state: a.schedule?.kind === 'once' && !a.enabled ? 'done' : a.enabled ? 'active' : 'paused',
+  lastRunAt: a.lastRunAt || null, lastStatus: a.lastStatus || null, runs: a.runs || 0,
+});
+const NO_CAL = { status: 409, body: { error: 'calendar_off', message: "Calendar isn't switched on for your account." } };
+const NOT_CONNECTED = { status: 409, body: { error: 'not_connected', message: 'Your calendar isn’t connected yet. Send /connect google to your agent in Telegram.' } };
+const RECONNECT = { status: 409, body: { error: 'reconnect', message: 'Your Google connection expired. Send /connect google to your agent in Telegram.' } };
+const bad = (message) => ({ status: 400, body: { error: 'invalid', message } });
+
+const webOps = {
+  async schedule(tenant, days) {
+    const tz = tenantTz(tenant);
+    const now = new Date();
+    const calendarOn = Boolean(google && tenant.tools.includes('calendar'));
+    const connected = Boolean(calendarOn && google.isConnected(tenant.chatId));
+    let events = [];
+    let calendar = !calendarOn ? 'off' : connected ? 'ok' : 'not_connected';
+    if (connected) {
+      const from = startOfLocalDay(now, tz);
+      try {
+        events = await google.eventsBetween(tenant.chatId, from.toISOString(), new Date(from.getTime() + days * 864e5).toISOString(), 60);
+      } catch (err) { calendar = err instanceof NeedsReconnect ? 'reconnect' : 'unavailable'; }
+    }
+    const agents = store.agents(tenant.chatId).filter((a) => a.enabled);
+    const runs = agents.flatMap((a) => nextRuns(a.schedule, { now, tz, days }).map((d) => ({ agentId: a.id, name: a.name, at: d.toISOString() }))).sort((x, y) => x.at.localeCompare(y.at)).slice(0, 60);
+    return { body: {
+      tz, now: now.toISOString(), today: localDate(now, tz), days, calendar,
+      events: events.map((e) => ({ id: String(e.id || '').slice(0, 80), title: String(e.title || '').slice(0, 120), start: e.start, end: e.end || null, allDay: Boolean(e.allDay) })),
+      runs,
+      beforeEvent: agents.filter((a) => a.schedule?.kind === 'before_event').map((a) => ({ agentId: a.id, name: a.name, minutes: a.schedule.minutes })),
+    } };
+  },
+
+  async addEvent(tenant, b) {
+    const ent = await entFor(tenant);
+    if (ent && !ent.canUse) return pausedBody(ent);
+    if (!google || !tenant.tools.includes('calendar')) return NO_CAL;
+    if (!google.isConnected(tenant.chatId)) return NOT_CONNECTED;
+    const tz = tenantTz(tenant);
+    const title = String(b.title || '').replace(/[\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!title) return bad('Give the event a name.');
+    if (title.length > 80) return bad('Keep the name under 80 characters.');
+    if (SECRET_RE.test(title)) return bad('That looks like a password or key, so I did not add it.');
+    const start = fromLocal(b.date, b.time, tz);
+    if (!start) return bad('Pick a date and a time.');
+    const minutes = Math.round(Number(b.minutes) || 60);
+    if (minutes < 5 || minutes > 720) return bad('Pick a length between 5 minutes and 12 hours.');
+    if (start.getTime() < Date.now() - 5 * 60000) return bad('That time has already passed.');
+    const end = new Date(start.getTime() + minutes * 60000);
+    if (b.force !== true) {
+      try {
+        const clash = (await google.eventsBetween(tenant.chatId, start.toISOString(), end.toISOString())).filter((e) => !e.allDay).slice(0, 3);
+        if (clash.length) return { body: { needsConfirm: true, clash: clash.map((e) => ({ title: String(e.title).slice(0, 120), start: e.start })) } };
+      } catch (err) { if (err instanceof NeedsReconnect) return RECONNECT; /* can't check for clashes: carry on */ }
+    }
+    try {
+      await google.createEvent(tenant.chatId, { title, startISO: start.toISOString(), endISO: end.toISOString(), tz });
+    } catch (err) {
+      if (err instanceof NeedsMoreAccess) return { status: 409, body: { error: 'needs_more_access', message: 'To add events I need a bit more permission than you gave before. Send /connect google to your agent in Telegram and approve it again.' } };
+      if (err instanceof NeedsReconnect) return RECONNECT;
+      console.warn('[web api] calendar add failed:', err?.message);
+      return { status: 502, body: { error: 'google_failed', message: 'Google didn’t accept that just now, so nothing was added. Try again in a minute.' } };
+    }
+    logEvent(tenant, { kind: 'action', action: 'create_event', status: 'done' });
+    return { body: { ok: true, event: { title, start: start.toISOString(), end: end.toISOString() } } };
+  },
+
+  async agents(tenant) {
+    const tz = tenantTz(tenant);
+    return { body: {
+      cap: agentCap(tenant), tz,
+      agents: store.agents(tenant.chatId).map((a) => publicAgent(a, tz)),
+      tools: agentKit.availableTools(tenant, { googleOn: Boolean(google), googleConnected: Boolean(google?.isConnected(tenant.chatId)) }).map((o) => ({ key: o.key, label: o.label, does: o.does, usable: o.usable, why: o.usable ? '' : o.why })),
+    } };
+  },
+
+  async createAgent(tenant, b) {
+    const ent = await entFor(tenant);
+    if (ent && !ent.canUse) return pausedBody(ent);
+    const cap = agentCap(tenant);
+    if (store.agents(tenant.chatId).length >= cap) return { status: 409, body: { error: 'cap', message: `You already have ${cap} agents, the most you can have right now. Delete one first.` } };
+    const v = agentKit.validateAgentForm(b, agentCtx(tenant));
+    if (v.error) return bad(v.error);
+    if (SECRET_RE.test(`${v.fields.name} ${v.fields.purpose} ${v.fields.info}`)) return bad('That looks like a password or key, so I did not save it. Take it out and try again.');
+    const rec = agentKit.newAgentRecord(v.fields);
+    const added = store.addAgent(tenant.chatId, rec, cap);
+    if (added.error) return { status: 409, body: { error: 'cap', message: 'You already have the most agents you can have right now.' } };
+    logEvent(tenant, { kind: 'action', action: 'agent_create', status: 'done' });
+    return { status: 201, body: { ok: true, agent: publicAgent(rec, tenantTz(tenant)) } };
+  },
+
+  async agentVerb(tenant, id, verb, b) {
+    const a = store.agents(tenant.chatId).find((x) => x.id === id);
+    if (!a) return { status: 404, body: { error: 'not_found', message: 'That agent is already gone.' } };
+    const tz = tenantTz(tenant);
+    if (verb === 'run') {
+      const ent = await entFor(tenant);
+      if (ent && !ent.canUse) return pausedBody(ent);
+      const day = new Date().toISOString().slice(0, 10), key = String(tenant.chatId);
+      const m = manualRuns.get(key);
+      const n = m && m.day === day ? m.n : 0;
+      if (n >= MAX_MANUAL_RUNS) return { status: 429, body: { error: 'limit', message: `That's ${MAX_MANUAL_RUNS} manual runs today. It still runs on its schedule.` } };
+      manualRuns.set(key, { day, n: n + 1 });
+      const r = await als.run({ tenant, ent }, () => runAction(tenant, 'agent_run', { agentId: id, manual: true }));
+      return { body: { ok: true, text: String(r.text || '').slice(0, 2000), agent: publicAgent(store.agents(tenant.chatId).find((x) => x.id === id) || a, tz) } };
+    }
+    if (verb === 'pause') { store.updateAgent(tenant.chatId, id, { enabled: false }); }
+    else if (verb === 'resume') { store.updateAgent(tenant.chatId, id, { enabled: true, armedAt: new Date().toISOString() }); }
+    else if (verb === 'delete') { store.removeAgent(tenant.chatId, id); logEvent(tenant, { kind: 'action', action: 'agent_delete', status: 'done' }); return { body: { ok: true } }; }
+    else if (verb === 'update') {
+      const ent = await entFor(tenant);
+      if (ent && !ent.canUse) return pausedBody(ent);
+      const v = agentKit.validateAgentForm(b, { ...agentCtx(tenant), keepSchedule: a.schedule });
+      if (v.error) return bad(v.error);
+      if (SECRET_RE.test(`${v.fields.name} ${v.fields.purpose} ${v.fields.info}`)) return bad('That looks like a password or key, so I did not save it. Take it out and try again.');
+      const changed = JSON.stringify(v.fields.schedule) !== JSON.stringify(a.schedule);
+      store.updateAgent(tenant.chatId, id, { name: String(b.name || '').trim() ? v.fields.name : a.name, purpose: v.fields.purpose, info: v.fields.info, tools: v.fields.tools, sheet: v.fields.sheet, schedule: v.fields.schedule, ...(changed ? { enabled: true, armedAt: new Date().toISOString(), briefed: {} } : {}) });
+    }
+    else if (verb === 'schedule') {
+      const s = parseSchedule(String(b.schedule || '').slice(0, 120), { tz });
+      if (!s) return bad('I didn\'t catch a time. Try "every weekday at 8am", "daily at 5:30pm", "tomorrow at 9am", "30 minutes before every meeting", or "only when I ask".');
+      if (s.kind === 'before_event' && !google?.isConnected(tenant.chatId)) return bad('Running before your meetings needs your calendar. Send /connect google in Telegram first.');
+      store.updateAgent(tenant.chatId, id, { schedule: s, enabled: true, armedAt: new Date().toISOString(), briefed: {} });
+    }
+    return { body: { ok: true, agent: publicAgent(store.agents(tenant.chatId).find((x) => x.id === id), tz) } };
+  },
+};
+mountWebApi(app, {
+  express,
+  auth: webAuth,
+  getTenant: (chatId) => store.get(chatId),
+  ops: webOps,
+  siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
+  extraOrigins: String(process.env.WEB_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  log: (line) => console.log(line),
+});
+
 
 // Where Google sends people back after they approve. The `state` value ties
 // the visit to the chat that asked for the link.
@@ -2163,7 +2621,7 @@ app.get('/oauth/google/callback', async (req, res) => {
   try {
     const { chatId, email } = await google.finishSignIn(state, code);
     res.send(page('Connected ✓', 'You can close this tab and go back to Telegram.'));
-    await sendTelegramMessage(chatId, `Google connected${email ? ` as ${email}` : ''} ✅ I can now save email drafts to your Gmail and check your calendar. Try: "what's on my calendar today?"`);
+    await sendTelegramMessage(chatId, `Google connected${email ? ` as ${email}` : ''} ✅ I can now save email drafts to your Gmail and check or add to your calendar. Try: "what's on my calendar today?"`);
   } catch (err) {
     console.error('Google sign-in failed:', err.message);
     res.status(400).send(page('Not connected', err.message));
@@ -2265,6 +2723,7 @@ async function setBotCommands() {
         { command: 'model', description: 'Choose the AI used for coding' },
         { command: 'changes', description: 'See saved code changes and push one' },
         { command: 'connections', description: 'See what is linked' },
+        { command: 'agents', description: 'Build and manage your agents' },
         { command: 'disconnect', description: 'Unlink an account' },
         { command: 'instructions', description: 'Tell me about your business' },
       ] }),
@@ -2282,6 +2741,104 @@ if (signups.enabled && ADMIN_ID) {
   setTimeout(poll, Math.min(5000, every)).unref();
   setInterval(poll, every).unref();
 }
+// ---------------------------------------------------------------------------
+// The agent clock: every few seconds, see which agents have come due and run them, one at a time per business.
+// A run that is more than 3 hours late (the computer was off) is skipped rather than sent at a silly time.
+// ---------------------------------------------------------------------------
+async function runScheduledAgent(chatId, agentId, extra = {}) {
+  const tenant = store.get(chatId);
+  const agent = tenant && store.agents(chatId).find((a) => a.id === agentId);
+  if (!tenant || !agent) return;
+  let ent = null;
+  try { ent = await entitlements.get(tenant); } catch { ent = null; }
+  if (ent && !ent.canUse) { logEvent(tenant, { kind: 'blocked', action: 'agent_run', status: 'blocked', reason: 'account paused' }); return; }
+  await als.run({ tenant, ent }, async () => {
+    try {
+      const r = await runAction(tenant, 'agent_run', { agentId, ...extra });
+      await sendTelegramMessage(chatId, r.text);
+    } catch (err) {
+      console.error('[agent] scheduled run failed:', err?.name || 'Error');
+      store.updateAgent(chatId, agentId, { lastStatus: 'failed' });
+      await sendTelegramMessage(chatId, `🤖 ${agent.name} couldn't run this time. I'll try again at its next run.`).catch(() => {});
+    }
+  });
+}
+let agentTicking = false;
+async function agentTick(now = new Date()) {
+  if (agentTicking) return;
+  agentTicking = true;
+  try {
+    for (const tenant of store.list()) {
+      for (const a of store.agents(tenant.chatId)) {
+        if (!a.enabled) continue;
+        const since = new Date(Math.max(Date.parse(a.lastRunAt || '') || 0, Date.parse(a.armedAt || '') || 0, Date.parse(a.createdAt || '') || 0));
+        if (!dueAt(a.schedule, { now, tz: tenantTz(tenant), since })) continue;
+        store.updateAgent(tenant.chatId, a.id, { lastRunAt: now.toISOString(), ...(a.schedule?.kind === 'once' ? { enabled: false } : {}) }); // claim it first, so a slow run can never fire twice
+        enqueue(String(tenant.chatId), () => runScheduledAgent(tenant.chatId, a.id)).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('[agent] clock check failed:', err?.message);
+  } finally { agentTicking = false; }
+}
+{
+  const every = Number(process.env.AGENT_TICK_MS) || 30000;
+  setTimeout(agentTick, Math.min(3000, every)).unref();
+  setInterval(agentTick, every).unref();
+}
+// "30 minutes before every meeting": look at the calendar every couple of minutes for businesses that have such an
+// agent, and run it once for each timed meeting that is about to start. Events already handled are remembered
+// (agent.briefed) so a restart or a re-check can never send the same one twice.
+const EVENT_POLL_MS = Number(process.env.EVENT_POLL_MS) || 120000;
+const MAX_BRIEFS_PER_DAY = Number(process.env.AGENT_BRIEFS_PER_DAY) || 8;
+const eventPolledAt = new Map(); // chatId -> when we last looked at their calendar
+const briefCounts = new Map(); // agentId -> { day, n }
+let eventTicking = false;
+async function eventTick(now = new Date()) {
+  if (eventTicking) return;
+  eventTicking = true;
+  try {
+    for (const tenant of store.list()) {
+      const mine = store.agents(tenant.chatId).filter((a) => a.enabled && a.schedule?.kind === 'before_event');
+      if (!mine.length || !google?.isConnected(tenant.chatId) || !tenant.tools.includes('calendar')) continue;
+      if (now.getTime() - (eventPolledAt.get(tenant.chatId) || 0) < EVENT_POLL_MS) continue;
+      eventPolledAt.set(tenant.chatId, now.getTime());
+      const reach = Math.max(...mine.map((a) => a.schedule.minutes || 30)) + 5;
+      let events;
+      try { events = await google.eventsBetween(tenant.chatId, now.toISOString(), new Date(now.getTime() + reach * 60000).toISOString()); } catch { continue; }
+      const day = now.toISOString().slice(0, 10);
+      for (const a of mine) {
+        const briefed = { ...(a.briefed || {}) };
+        let changed = false;
+        for (const e of events) {
+          if (e.allDay || !e.id || briefed[e.id]) continue;
+          const lead = Date.parse(e.start) - now.getTime();
+          if (!(lead >= 2 * 60000 && lead <= (a.schedule.minutes || 30) * 60000)) continue;
+          const c = briefCounts.get(a.id);
+          const n = c && c.day === day ? c.n : 0;
+          if (n >= MAX_BRIEFS_PER_DAY) continue;
+          briefCounts.set(a.id, { day, n: n + 1 });
+          briefed[e.id] = Date.parse(e.start);
+          changed = true;
+          enqueue(String(tenant.chatId), () => runScheduledAgent(tenant.chatId, a.id, { event: { title: e.title, start: e.start } })).catch(() => {});
+        }
+        if (changed) {
+          const keep = Object.entries(briefed).sort((x, y) => y[1] - x[1]).slice(0, 60); // only the newest 60 are remembered
+          store.updateAgent(tenant.chatId, a.id, { briefed: Object.fromEntries(keep) });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[agent] calendar check failed:', err?.message);
+  } finally { eventTicking = false; }
+}
+{
+  const every = Math.min(Number(process.env.AGENT_TICK_MS) || 30000, EVENT_POLL_MS);
+  setTimeout(eventTick, Math.min(4000, every)).unref();
+  setInterval(eventTick, every).unref();
+}
+
+
 app.listen(PORT, () => {
   console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, action log: ${actionLog.enabled ? 'on' : 'off'}, website linking: ${linker.enabled ? 'on' : 'off'}, sign-up approvals: ${signups.enabled && ADMIN_ID ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);
 });

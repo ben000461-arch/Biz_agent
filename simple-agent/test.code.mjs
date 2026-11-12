@@ -498,9 +498,9 @@ console.log('[the helper]');
   mode.code = 'fixed';
   // secrets
   const mc2 = modelCalls.length;
-  t = await say(111, 'here is my key gsk_abcdefghijklmnopqrstuvwxyz0123456789ABCD please use it');
+  t = await say(111, 'here is my key gsk_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE please use it');
   check('a pasted secret is refused, not read: no model call', /don't send those in chat/.test(t) && modelCalls.length === mc2, t);
-  check('github token and PEM are caught too', /don't send those/.test(await say(222, 'ghp_abcdefghijklmnopqrstuvwxyz0123456789')) && /don't send those/.test(await say(222, '-----BEGIN RSA PRIVATE KEY-----')));
+  check('github token and PEM are caught too', /don't send those/.test(await say(222, 'ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE')) && /don't send those/.test(await say(222, '-----BEGIN RSA PRIVATE KEY-----')));
   check('the secret text never appears in the reply', !/gsk_abc/.test(t));
   check('normal sentences are not flagged', !/don't send those/.test(await say(111, 'make a note: ask-for-sk-ills review')));
   const chatCall = modelCalls.find((m) => m.system.includes('helpful, direct assistant'));
