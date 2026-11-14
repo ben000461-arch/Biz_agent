@@ -24,9 +24,10 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try { return await fetchImpl(u, { ...opts, signal: ctl.signal }); } finally { clearTimeout(timer); }
   };
-  const restHeaders = () => {
-    const h = { apikey: secret };
+  const restHeaders = (prefer) => {
+    const h = { 'content-type': 'application/json', apikey: secret };
     if (secret.startsWith('eyJ')) h.authorization = `Bearer ${secret}`;
+    if (prefer) h.Prefer = prefer;
     return h;
   };
   const prune = (map) => { if (map.size > 500) for (const [k, v] of map) { if (v.until < now()) map.delete(k); } if (map.size > 1000) map.clear(); };
@@ -71,7 +72,37 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     return { chatId };
   }
 
-  return { verify, chatFor, enabled };
+  // Save user + assistant messages to Supabase (fire-and-forget, never blocks the response)
+  async function saveMessages(chatId, userText, assistantReplies) {
+    if (!enabled) return;
+    const rows = [
+      { chat_id: chatId, role: 'user', content: userText },
+      ...assistantReplies.map((r) => ({ chat_id: chatId, role: 'assistant', content: r })),
+    ];
+    try {
+      await withTimeout(`${base}/rest/v1/web_chat_messages`, {
+        method: 'POST',
+        headers: restHeaders('return=minimal'),
+        body: JSON.stringify(rows),
+      });
+    } catch { /* best-effort: chat still works if save fails */ }
+  }
+
+  // Load recent messages for a chat (called by GET /web/chat/history)
+  async function loadMessages(chatId, limit = 100) {
+    if (!enabled) return [];
+    try {
+      const res = await withTimeout(
+        `${base}/rest/v1/web_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=role,content,created_at&order=created_at.asc&limit=${limit}`,
+        { method: 'GET', headers: restHeaders() },
+      );
+      if (!res.ok) return [];
+      const rows = await res.json();
+      return Array.isArray(rows) ? rows : [];
+    } catch { return []; }
+  }
+
+  return { verify, chatFor, saveMessages, loadMessages, enabled };
 }
 
 // A tiny sliding-window counter: allow(key) -> true while under `max` hits in the last `windowMs`.
@@ -99,18 +130,40 @@ export function mountWebChat(app, { express, auth, getTenant, run, siteOrigin, e
     if (origin && allowed.has(origin)) {
       res.set({
         'Access-Control-Allow-Origin': origin,
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
         'Access-Control-Allow-Headers': 'authorization, content-type, ngrok-skip-browser-warning',
         'Access-Control-Max-Age': '600',
       });
     } else if (origin) {
-      return res.status(403).json({ error: 'origin not allowed' }); // a page from somewhere else may not use this
+      return res.status(403).json({ error: 'origin not allowed' });
     }
     next();
   };
 
   app.options('/web/chat', cors, (_req, res) => res.status(204).end());
+  app.options('/web/chat/history', cors, (_req, res) => res.status(204).end());
 
+  // ---- load chat history ----
+  app.get('/web/chat/history', cors, async (req, res) => {
+    try {
+      const m = /^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '');
+      const who = await auth.verify(m ? m[1] : '');
+      if (who.error === 'unauthorized') return res.status(401).json({ error: 'sign in again' });
+      if (who.error) return res.status(503).json({ error: 'try again in a moment' });
+
+      const link = await auth.chatFor(who.userId);
+      if (link.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
+      if (!link.chatId) return res.json({ messages: [] });
+
+      const messages = await auth.loadMessages(link.chatId);
+      res.json({ messages });
+    } catch (err) {
+      console.error('[web chat history] failed:', err?.name || 'Error');
+      res.status(500).json({ error: 'something went wrong' });
+    }
+  });
+
+  // ---- send message ----
   app.post('/web/chat', cors, (req, res, next) => {
     if (!ipLimit(req.ip || 'x')) return res.status(429).json({ error: 'too many requests' });
     next();
@@ -138,6 +191,10 @@ export function mountWebChat(app, { express, auth, getTenant, run, siteOrigin, e
       const out = replies.map((r) => String(r).trim()).filter(Boolean).slice(0, 10);
       if (!out.length && !files.length) out.push('I’m getting messages faster than I can answer. Wait a few seconds and try again.');
       log(`[web chat ${tenant.chatId}] answered (${out.length} repl${out.length === 1 ? 'y' : 'ies'})`);
+
+      // Save both sides of the conversation (fire-and-forget)
+      auth.saveMessages(link.chatId, text, out).catch(() => {});
+
       res.json(files.length ? { replies: out, files } : { replies: out });
     } catch (err) {
       console.error('[web chat] failed:', err?.name || 'Error');
