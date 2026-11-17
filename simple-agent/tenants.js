@@ -149,6 +149,7 @@ export function createStore(file) {
       if (!t) return false;
       if ('modelChoice' in patch) t.modelChoice = patch.modelChoice === null ? undefined : String(patch.modelChoice).slice(0, 40);
       if ('cloudOk' in patch) t.cloudOk = Boolean(patch.cloudOk);
+      if ('googleExpiredAt' in patch) t.googleExpiredAt = patch.googleExpiredAt ? String(patch.googleExpiredAt).slice(0, 40) : undefined; // their Google sign-in died; cleared on reconnect
       save();
       return true;
     },

@@ -15,7 +15,7 @@ export class NeedsReconnect extends Error {}
 // the saved sign-in is fine but was granted before we asked for this permission (e.g. read-only calendar)
 export class NeedsMoreAccess extends Error {}
 
-export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases = {} }) {
+export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases = {}, onExpired = () => {} }) {
   const AUTH = bases.auth || 'https://accounts.google.com/o/oauth2/v2/auth';
   const TOKEN = bases.token || 'https://oauth2.googleapis.com/token';
   const REVOKE = bases.revoke || 'https://oauth2.googleapis.com/revoke';
@@ -120,6 +120,7 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
         if (data.error === 'invalid_grant') {
           vault.remove(id, 'google');
           accessCache.delete(id);
+          try { onExpired(id); } catch { /* telling them must never break the caller */ }
           throw new NeedsReconnect('expired');
         }
         throw new Error('Could not refresh the Google sign-in');

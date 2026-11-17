@@ -89,16 +89,16 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
   }
 
   // Load recent messages for a chat (called by GET /web/chat/history)
-  async function loadMessages(chatId, limit = 100) {
+  async function loadMessages(chatId, limit = 300) {
     if (!enabled) return [];
     try {
       const res = await withTimeout(
-        `${base}/rest/v1/web_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=role,content,created_at&order=created_at.asc&limit=${limit}`,
+        `${base}/rest/v1/web_chat_messages?chat_id=eq.${encodeURIComponent(chatId)}&select=role,content,created_at&order=created_at.desc&limit=${limit}`,
         { method: 'GET', headers: restHeaders() },
       );
       if (!res.ok) return [];
       const rows = await res.json();
-      return Array.isArray(rows) ? rows : [];
+      return Array.isArray(rows) ? rows.reverse() : []; // the NEWEST `limit` messages, oldest first
     } catch { return []; }
   }
 
@@ -119,7 +119,7 @@ export function createLimiter({ max, windowMs = 60000, now = () => Date.now() })
   };
 }
 
-export function mountWebChat(app, { express, auth, getTenant, run, siteOrigin, extraOrigins = [], perUserPerMinute = 40, perIpPerMinute = 120, log = () => {} }) {
+export function mountWebChat(app, { express, auth, getTenant, run, siteOrigin, extraOrigins = [], perUserPerMinute = 40, perIpPerMinute = 120, log = () => {}, onError = () => {} }) {
   const allowed = new Set([siteOrigin, ...extraOrigins].filter(Boolean));
   const userLimit = createLimiter({ max: perUserPerMinute });
   const ipLimit = createLimiter({ max: perIpPerMinute });
@@ -198,6 +198,7 @@ export function mountWebChat(app, { express, auth, getTenant, run, siteOrigin, e
       res.json(files.length ? { replies: out, files } : { replies: out });
     } catch (err) {
       console.error('[web chat] failed:', err?.name || 'Error');
+      try { onError('chat', err); } catch { /* ignore */ }
       res.status(500).json({ error: 'something went wrong' });
     }
   });

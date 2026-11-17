@@ -88,7 +88,7 @@ const proc = spawn('node', ['server.js'], {
     TENANTS_FILE: tenantsFile, WORKSPACES_DIR: path.join(tmp, 'ws'), CONNECTIONS_FILE: path.join(tmp, 'conn.json'), PUBLIC_URL: 'https://example.ngrok-free.dev',
     GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'csecret', TOKEN_ENCRYPTION_KEY: 'ab'.repeat(32),
     GOOGLE_AUTH_BASE: `${gv}/auth`, GOOGLE_TOKEN_URL: `${gv}/token`, GOOGLE_REVOKE_URL: `${gv}/revoke`, GMAIL_API_BASE: `${gv}/gmail`, CALENDAR_API_BASE: `${gv}/calendar`,
-    SITE_URL: `${SITE}/coop/`, WEB_ORIGINS: 'https://other.test', SUPABASE_URL: `http://127.0.0.1:${P.sb}`, SUPABASE_SERVICE_KEY: 'sb_secret_test',
+    SITE_URL: `${SITE}/coop/`, WEB_ORIGINS: 'https://other.test', SUPABASE_URL: `http://127.0.0.1:${P.sb}`, SUPABASE_SERVICE_KEY: 'sb_secret_test', WEB_API_PER_USER_MIN: '1000',
     AGENT_TICK_MS: '60000', EVENT_POLL_MS: '60000', MAX_AGENTS: '3', WEB_API_PER_USER: '150',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -295,7 +295,7 @@ try {
   console.log('\n[manual run limit]');
   let last;
   for (let i = 0; i < 12; i++) { last = await call('POST', `/agents/${a1.id}/run`, jwt('a')); if (last.status === 429) break; }
-  check('manual runs stop at the daily limit with a friendly message', last.status === 429 && last.body.error === 'limit', `${last.status}`);
+  check('manual runs stop at the daily limit with a friendly message', last.status === 429 && last.body.error === 'limit', `${last.status} ${JSON.stringify(last.body)}`);
 
   console.log('\n[paused account]');
   r = await call('GET', '/agents', jwt('frozen'));

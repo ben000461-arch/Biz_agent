@@ -35,6 +35,8 @@ import { createGitHub, readPrivateKey } from './github.js';
 import { runCodeTask, parseCodeRequest } from './coder.js';
 import { createModelConnector, extractJson, PROVIDERS } from './models.js';
 import { createLogger } from './logger.js';
+import { createAlerts, redact } from './alerts.js';
+import { createAccounts } from './account.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -97,7 +99,11 @@ const store = createStore(TENANTS_FILE || path.join(__dirname, 'data', 'tenants.
 const workspacesRoot = WORKSPACES_DIR || path.join(__dirname, 'workspaces');
 
 // Action log: what the agent did (never what anyone said). Off unless both Supabase settings are present.
-const actionLog = createLogger({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+// Problems worth the owner's attention go to the admin's Telegram (rate limited; see alerts.js).
+const alerts = createAlerts({ send: (id, t) => sendTelegramMessage(id, t), adminId: ADMIN_ID });
+const alert = (key, text) => alerts.alert(key, text);
+const actionLog = createLogger({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY, onError: () => alert('log-write', 'The action log could not be written to Supabase. Logs are being held in memory and retried. Check that Supabase is up (free projects pause after a week with no activity).') });
+const accounts = createAccounts({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const linker = createLinker({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const signups = createSignups({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 
@@ -137,7 +143,7 @@ async function settle(ctx, tenant, action, kind) {
 }
 console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
 // Commands a paused (frozen) customer may still use: seeing help, and disconnecting their own accounts.
-const FROZEN_OK_COMMANDS = new Set(['/start', '/help', '/connections', '/disconnect', '/disconnect_google', '/disconnect_github', '/disconnect_model', '/unlink']);
+const FROZEN_OK_COMMANDS = new Set(['/start', '/help', '/connections', '/deleteaccount', '/deleteaccount_confirm', '/disconnect', '/disconnect_google', '/disconnect_github', '/disconnect_model', '/unlink']);
 function logEvent(tenant, row) {
   if (!tenant) return;
   actionLog.log({ chat_id: String(tenant.chatId), business: tenant.name, ...row });
@@ -210,6 +216,7 @@ if (vault) {
       publicUrl: PUBLIC_URL,
       vault,
       bases: { auth: GOOGLE_AUTH_BASE, token: GOOGLE_TOKEN_URL, revoke: GOOGLE_REVOKE_URL, gmail: GMAIL_API_BASE, calendar: CALENDAR_API_BASE },
+      onExpired: (chatId) => googleExpired(chatId),
     });
   } else {
     console.warn('Google connection off: set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env to turn it on.');
@@ -673,13 +680,47 @@ async function doDisconnect(tenant, provider) {
   return 'That was already disconnected.';
 }
 
-// The shared AI key stopped working: tell the admin (at most once an hour).
-let lastAdminAlert = 0;
-function notifyAdminOnce(text) {
-  if (!ADMIN_ID || Date.now() - lastAdminAlert < 60 * 60 * 1000) return;
-  lastAdminAlert = Date.now();
-  sendTelegramMessage(ADMIN_ID, `⚠️ ${text}`).catch(() => {});
+// A customer's Google sign-in stopped working (they removed access in their Google account, changed their
+// password, or the token aged out). google.js has already forgotten it; tell them once, and tell the admin.
+function googleExpired(chatId) {
+  const tenant = store.get(chatId);
+  if (!tenant) return;
+  store.setPrefs(chatId, { googleExpiredAt: new Date().toISOString() });
+  logEvent(tenant, { kind: 'error', action: 'google_expired', status: 'failed', reason: 'Google sign-in stopped working' });
+  sendTelegramMessage(chatId, "⚠️ Your Google connection stopped working, so I can't see your calendar or save email drafts right now. Type connect and pick Google to reconnect. It takes about a minute. Anything scheduled will work again as soon as you do.").catch(() => {});
+  alert(`google-expired:${chatId}`, `Google stopped working for ${tenant.name || 'a business'} (chat ${chatId}). They've been asked to reconnect.`);
 }
+
+// "Delete my account and data". Removes everything this business has with us except payment records
+// (see account.js for the exact list). The admin's own record can't be deleted this way.
+const deleteAsks = new Map(); // chatId -> when they asked (Telegram needs a second, explicit confirm)
+async function deleteAccount(tenant, via) {
+  const chatId = String(tenant.chatId);
+  if (tenant.isAdmin) return { error: 'admin', message: "The owner account can't be deleted from here." };
+  const check = await accounts.check(chatId);
+  if (check.error) return { error: 'unavailable', message: "I couldn't reach the account service just now, so nothing was deleted. Try again in a minute." };
+  if (check.blocked === 'paid_plan') return { error: 'paid_plan', message: 'You still have a paid plan running. Cancel it first (Settings → Manage billing), then delete your account.' };
+  const name = tenant.name || 'a business';
+  const remote = await accounts.remove(chatId);
+  // local data: saved sign-ins (revoked with Google/GitHub where possible), agents, notes, files, memory
+  try { if (google) await google.disconnect(chatId); } catch { /* keep going */ }
+  try { if (github) await github.disconnect(chatId); } catch { /* keep going */ }
+  try { if (aiModel) aiModel.disconnectOwn(chatId); } catch { /* keep going */ }
+  try { vault?.removeAll(chatId); } catch { /* keep going */ }
+  for (const m of [pendingActions, notesByTenant, agentDrafts, manualRuns, bookingAsks, deleteAsks, eventPolledAt]) { try { m.delete(chatId); } catch { /* ignore */ } }
+  resetMemory(chatId);
+  const ws = path.resolve(workspacesRoot, chatId);
+  if (ws.startsWith(path.resolve(workspacesRoot) + path.sep)) { try { fs.rmSync(ws, { recursive: true, force: true }); } catch { /* reported below */ } }
+  store.remove(chatId);
+  const partial = remote.error ? ['website data'] : remote.failed;
+  console.log(`[account] chat ${chatId} deleted via ${via}${partial.length ? ` (incomplete: ${partial.join(', ')})` : ''}`);
+  alert(`deleted:${chatId}`, `${name} (chat ${chatId}) deleted their account from ${via}.${partial.length ? ` Some data could not be removed automatically: ${partial.join(', ')}. Remove it by hand in Supabase.` : ' Everything was removed.'}`);
+  return { ok: true, partial };
+}
+const DELETED_MSG = 'Your account and data are deleted: chats, logs, agents, notes, files and saved sign-ins. Payment records are kept for accounting. Thanks for trying co|op.';
+
+// The shared AI key stopped working: tell the admin (at most once an hour).
+function notifyAdminOnce(text) { alert('shared-ai', text); }
 
 
 // ---- Saved changes: find earlier /code results again, and push one later ----
@@ -1132,6 +1173,7 @@ async function agentRunAction(tenant, args) {
   } catch { reply = ''; }
   if (!reply || CLAIMED_ACTION_RE.test(reply)) {
     store.updateAgent(tenant.chatId, agent.id, { lastStatus: 'failed' });
+    if (!args.manual) alert(`agent-empty:${tenant.chatId}`, `A scheduled agent got no answer from the AI: "${agent.name}" for ${tenant.name || 'a business'} (chat ${tenant.chatId}). Check that Ollama is running (and Groq, if it's the fallback).`);
     return { text: `🤖 ${agent.name}: I couldn't put the message together this time (the AI didn't answer). ${args.manual ? 'Try /agent run again in a minute.' : "I'll try again at its next run."}` };
   }
   store.updateAgent(tenant.chatId, agent.id, { lastRunAt: now.toISOString(), lastStatus: 'ok', runs: (agent.runs || 0) + 1 });
@@ -1608,6 +1650,7 @@ function helpText(tenant) {
   if (github?.isConnected(tenant.chatId) && has('github')) lines.push('• GitHub — "what pull requests are open?", "is the build passing?"', '• Code — "/code in myapp, fix the crash in server.js" (I show you the change, and only push it as a pull request if you say yes; /changes lists saved ones)');
   if (aiModel && github?.isConnected(tenant.chatId) && has('github')) lines.push('Send /model to choose which AI does the coding.');
   if (google || github || aiModel) lines.push("Send /connect to link your accounts, and /connections to see what's linked.");
+  if (!tenant.isAdmin) lines.push('To delete your account and all its data, send /deleteaccount.');
   return lines.join('\n');
 }
 
@@ -1892,6 +1935,23 @@ async function handleCommand({ chatId, text, isAdmin }) {
       await sendTelegramMessage(chatId, r.error ? "I couldn't reach the database just now. Try again in a minute."
         : !r.rows.length ? 'No sign-ups are waiting.'
         : r.rows.map((x) => `${signupText(x)}\nApprove: /approve_${shortId(x.user_id)} · Deny: /deny_${shortId(x.user_id)}`).join('\n\n— — —\n\n'));
+      return true;
+    }
+
+    case '/deleteaccount': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      if (tenant.isAdmin) { await sendTelegramMessage(chatId, "The owner account can't be deleted with this command."); return true; }
+      deleteAsks.set(String(chatId), Date.now());
+      await sendTelegramMessage(chatId, 'This permanently deletes your account and everything in it: chats, logs, agents, notes, files, and your Google/GitHub connections. Payment records are kept for accounting. It can\'t be undone.\n\nTo go ahead, send /deleteaccount_confirm within 10 minutes. To keep everything, just ignore this.');
+      return true;
+    }
+    case '/deleteaccount_confirm': {
+      if (!tenant) { await sendTelegramMessage(chatId, INVITE_ONLY_MSG); return true; }
+      const asked = deleteAsks.get(String(chatId));
+      if (!asked || Date.now() - asked > 10 * 60 * 1000) { deleteAsks.delete(String(chatId)); await sendTelegramMessage(chatId, 'Send /deleteaccount first. For safety, the confirm only works for 10 minutes after that.'); return true; }
+      deleteAsks.delete(String(chatId));
+      const r = await deleteAccount(tenant, 'Telegram');
+      await sendTelegramMessage(chatId, r.ok ? DELETED_MSG : r.message);
       return true;
     }
 
@@ -2445,6 +2505,7 @@ console.log('Tool connections: ' + (toolConn.enabled ? 'on' : 'off (set TOOLCONN
 mountWebChat(app, {
   express,
   auth: webAuth,
+  onError: (where, err) => alert(`web:${where}`, `The website's ${where} request failed (${redact(err?.name || 'Error', 60)}). People may be seeing "Couldn't reach your agent".`),
   getTenant: (chatId) => store.get(chatId),
   siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
   extraOrigins: String(process.env.WEB_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -2478,23 +2539,49 @@ const RECONNECT = { status: 409, body: { error: 'reconnect', message: 'Your Goog
 const bad = (message) => ({ status: 400, body: { error: 'invalid', message } });
 
 const webOps = {
-  async schedule(tenant, days) {
+  // what is linked, for the Tools page (never a token, only yes/no and a name)
+  async connections(tenant) {
+    const id = tenant.chatId;
+    return { body: {
+      google: { available: Boolean(google), connected: Boolean(google?.isConnected(id)), expired: Boolean(tenant.googleExpiredAt) && !google?.isConnected(id) },
+      github: { available: Boolean(github), connected: Boolean(github?.isConnected(id)) },
+      model: { available: Boolean(aiModel), connected: Boolean(aiModel?.hasOwn(id)) },
+    } };
+  },
+  async disconnect(tenant, provider) {
+    if (!['google', 'github', 'model'].includes(provider)) return { status: 400, body: { error: 'invalid' } };
+    const message = await doDisconnect(tenant, provider);
+    logEvent(tenant, { kind: 'command', action: 'disconnect', status: 'done', detail: provider });
+    return { body: { ok: true, message } };
+  },
+  async deleteAccount(tenant, b) {
+    if (String(b.confirm || '') !== 'DELETE') return { status: 400, body: { error: 'confirm', message: 'Type DELETE to confirm.' } };
+    const r = await deleteAccount(tenant, 'the website');
+    if (!r.ok) return { status: r.error === 'paid_plan' ? 409 : r.error === 'admin' ? 403 : 503, body: { error: r.error, message: r.message } };
+    sendTelegramMessage(tenant.chatId, DELETED_MSG).catch(() => {});
+    return { body: { ok: true, partial: r.partial } };
+  },
+  async schedule(tenant, days, fromYmd = null) {
     const tz = tenantTz(tenant);
     const now = new Date();
+    const asked = fromYmd ? fromLocal(fromYmd, '00:00', tz) : null; // a month grid starts on a chosen day (bad dates -> null)
+    const start = asked || startOfLocalDay(now, tz);
+    const end = new Date(start.getTime() + days * 864e5);
     const calendarOn = Boolean(google && tenant.tools.includes('calendar'));
     const connected = Boolean(calendarOn && google.isConnected(tenant.chatId));
     let events = [];
     let calendar = !calendarOn ? 'off' : connected ? 'ok' : 'not_connected';
     if (connected) {
-      const from = startOfLocalDay(now, tz);
       try {
-        events = await google.eventsBetween(tenant.chatId, from.toISOString(), new Date(from.getTime() + days * 864e5).toISOString(), 60);
+        events = await google.eventsBetween(tenant.chatId, start.toISOString(), end.toISOString(), 60);
       } catch (err) { calendar = err instanceof NeedsReconnect ? 'reconnect' : 'unavailable'; }
     }
     const agents = store.agents(tenant.chatId).filter((a) => a.enabled);
-    const runs = agents.flatMap((a) => nextRuns(a.schedule, { now, tz, days }).map((d) => ({ agentId: a.id, name: a.name, at: d.toISOString() }))).sort((x, y) => x.at.localeCompare(y.at)).slice(0, 60);
+    const runFrom = start > now ? start : now; // runs are only ever in the future
+    const reach = Math.ceil((end.getTime() - runFrom.getTime()) / 864e5);
+    const runs = end <= now ? [] : agents.flatMap((a) => nextRuns(a.schedule, { now: runFrom, tz, days: reach }).filter((d) => d >= start && d < end).map((d) => ({ agentId: a.id, name: a.name, at: d.toISOString() }))).sort((x, y) => x.at.localeCompare(y.at)).slice(0, 60);
     return { body: {
-      tz, now: now.toISOString(), today: localDate(now, tz), days, calendar,
+      tz, now: now.toISOString(), today: localDate(now, tz), from: localDate(start, tz), days, calendar,
       events: events.map((e) => ({ id: String(e.id || '').slice(0, 80), title: String(e.title || '').slice(0, 120), start: e.start, end: e.end || null, allDay: Boolean(e.allDay) })),
       runs,
       beforeEvent: agents.filter((a) => a.schedule?.kind === 'before_event').map((a) => ({ agentId: a.id, name: a.name, minutes: a.schedule.minutes })),
@@ -2572,7 +2659,15 @@ const webOps = {
       if (n >= MAX_MANUAL_RUNS) return { status: 429, body: { error: 'limit', message: `That's ${MAX_MANUAL_RUNS} manual runs today. It still runs on its schedule.` } };
       manualRuns.set(key, { day, n: n + 1 });
       const r = await als.run({ tenant, ent }, () => runAction(tenant, 'agent_run', { agentId: id, manual: true }));
-      return { body: { ok: true, text: String(r.text || '').slice(0, 2000), agent: publicAgent(store.agents(tenant.chatId).find((x) => x.id === id) || a, tz) } };
+      const text = String(r.text || '').slice(0, 2000);
+      // a copy on Telegram, so the result is also where the scheduled ones arrive
+      const now = new Date();
+      const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).formatToParts(now).map((p) => [p.type, p.value]));
+      const checked = (a.tools || []).map((t) => (t === 'calendar' ? 'your calendar' : t === 'notes' ? 'your notes' : t === 'sheet' ? `the ${a.sheet || 'spreadsheet'} sheet` : t)).join(', ') || 'nothing';
+      const result = text.replace(/^🤖[^\n]*\n+/, '');
+      let notified = false;
+      try { await sendTelegramMessage(tenant.chatId, `🤖 ${a.name} was run from your website\n🕒 ${parts.weekday} ${parts.month} ${parts.day} at ${parts.hour}:${parts.minute} ${parts.dayPeriod} ${tzAbbrev(now, tz)}\nChecked: ${checked}\nResult:\n${result}`); notified = true; } catch { notified = false; }
+      return { body: { ok: true, text, notified, agent: publicAgent(store.agents(tenant.chatId).find((x) => x.id === id) || a, tz) } };
     }
     if (verb === 'pause') { store.updateAgent(tenant.chatId, id, { enabled: false }); }
     else if (verb === 'resume') { store.updateAgent(tenant.chatId, id, { enabled: true, armedAt: new Date().toISOString() }); }
@@ -2603,6 +2698,8 @@ mountWebApi(app, {
   siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
   extraOrigins: String(process.env.WEB_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
   log: (line) => console.log(line),
+  onError: (where, err) => alert(`web:${where}`, `The website's ${where} request failed (${redact(err?.name || 'Error', 60)}). People may be seeing "something went wrong".`),
+  perUserPerMinute: Number(process.env.WEB_API_PER_USER_MIN) || 60,
 });
 
 
@@ -2616,11 +2713,12 @@ app.get('/oauth/google/callback', async (req, res) => {
   if (!google) return res.status(404).send(page('Not available', 'Connections are not set up on this server.'));
   const { code, state, error } = req.query;
   if (error || typeof code !== 'string' || typeof state !== 'string') {
-    return res.status(400).send(page('Not connected', 'The sign-in was cancelled. Go back to Telegram and send /connect to try again.'));
+    return res.status(400).send(page('Not connected', 'The sign-in was cancelled. To try again, type connect in your agent chat.'));
   }
   try {
     const { chatId, email } = await google.finishSignIn(state, code);
-    res.send(page('Connected ✓', 'You can close this tab and go back to Telegram.'));
+    store.setPrefs(chatId, { googleExpiredAt: null });
+    res.send(page('Connected ✓', 'You can close this tab.'));
     await sendTelegramMessage(chatId, `Google connected${email ? ` as ${email}` : ''} ✅ I can now save email drafts to your Gmail and check or add to your calendar. Try: "what's on my calendar today?"`);
   } catch (err) {
     console.error('Google sign-in failed:', err.message);
@@ -2637,11 +2735,11 @@ app.get('/oauth/github/callback', async (req, res) => {
     return res.send(page('Updated ✓', 'Your GitHub project choices are saved. You can close this tab.'));
   }
   if (error || typeof code !== 'string' || typeof state !== 'string') {
-    return res.status(400).send(page('Not connected', 'The GitHub connection was cancelled. Go back to Telegram and send /connect github to try again.'));
+    return res.status(400).send(page('Not connected', 'The GitHub connection was cancelled. To try again, type connect in your agent chat.'));
   }
   try {
     const { chatId, account } = await github.finishInstall(state, code, typeof installationId === 'string' ? installationId : '');
-    res.send(page('Connected ✓', 'You can close this tab and go back to Telegram.'));
+    res.send(page('Connected ✓', 'You can close this tab.'));
     await sendTelegramMessage(chatId, `GitHub connected${account ? ` as ${account}` : ''} ✅ I can see the projects you picked. Try: "what pull requests are open?" or "is the build passing?" You can change which projects I see any time in GitHub → Settings → Applications.`);
   } catch (err) {
     console.error('GitHub connect failed:', err.message);
@@ -2669,7 +2767,7 @@ app.post('/connect/model', express.urlencoded({ extended: false, limit: '4kb' })
   if (!aiModel.isValidSetup(state)) return res.status(400).send(page('Link expired', 'Go back to Telegram and send /connect model for a new link.'));
   try {
     const r = await aiModel.finishSetup(state, { provider: String(b.provider || ''), model: String(b.model || ''), key: String(b.key || ''), label: String(b.label || '') });
-    res.send(page('Saved ✓', 'Your key is saved (encrypted). You can close this tab and go back to Telegram.'));
+    res.send(page('Saved ✓', 'Your key is saved (encrypted). You can close this tab.'));
     await sendTelegramMessage(r.chatId, r.managed
       ? `Model added for everyone: ${r.label} ✅ Businesses can now pick it with /model. I never saw the key — it went straight into the encrypted vault. See /models to manage the list.`
       : `AI model connected: ${r.label} ✅ /code will use your key when you pick it (/model) — or by default if no shared AI is set up. I never saw your key — it went straight into the encrypted vault. Remove it any time with /disconnect model.`);
@@ -2707,6 +2805,7 @@ app.post('/telegram-webhook', express.json(), (req, res) => {
     }
   }).catch((err) => {
     console.error('Unhandled error in message queue:', err);
+    alert('queue', `A message failed to process (${redact(err?.name || 'Error', 60)}). The person got no reply. Check the bot's log.`);
   });
 });
 
@@ -2759,6 +2858,7 @@ async function runScheduledAgent(chatId, agentId, extra = {}) {
     } catch (err) {
       console.error('[agent] scheduled run failed:', err?.name || 'Error');
       store.updateAgent(chatId, agentId, { lastStatus: 'failed' });
+      alert(`agent-crash:${chatId}:${agentId}`, `A scheduled agent crashed: "${agent.name}" for ${tenant.name || 'a business'} (chat ${chatId}). Error: ${redact(err?.name || 'Error', 60)}. They were told it will retry next run.`);
       await sendTelegramMessage(chatId, `🤖 ${agent.name} couldn't run this time. I'll try again at its next run.`).catch(() => {});
     }
   });
@@ -2779,6 +2879,7 @@ async function agentTick(now = new Date()) {
     }
   } catch (err) {
     console.warn('[agent] clock check failed:', err?.message);
+    alert('agent-clock', `The agent clock check failed (${redact(err?.name || 'Error', 60)}). Scheduled agents may not be running.`);
   } finally { agentTicking = false; }
 }
 {
@@ -2838,6 +2939,31 @@ async function eventTick(now = new Date()) {
   setInterval(eventTick, every).unref();
 }
 
+
+// Anything that slips past every other catch: tell the admin. An uncaught exception leaves the bot in an unknown state,
+// so after the alert has a moment to send, the process exits and the process manager (launchd/pm2) restarts it.
+process.on('unhandledRejection', (err) => {
+  console.error('[crash guard] unhandled promise rejection:', err?.name || 'Error');
+  alert('unhandled', `Something failed without being caught (${redact(err?.name || 'Error', 60)}: ${redact(err?.message || '', 160)}). The bot kept running. Check the log.`);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[crash guard] uncaught exception:', err);
+  alert('crash', `The bot crashed (${redact(err?.name || 'Error', 60)}: ${redact(err?.message || '', 160)}). It will restart if launchd/pm2 is set up. Otherwise start it again by hand.`);
+  setTimeout(() => process.exit(1), 2500).unref();
+});
+
+// Did the last run end cleanly? A marker file exists while the bot runs and is removed on a normal stop
+// (Ctrl+C, launchd/pm2 stop). If it's still there at start-up, the last run crashed or the computer lost power.
+const RUN_MARKER = path.join(path.dirname(TENANTS_FILE || path.join(__dirname, 'data', 'tenants.json')), '.running');
+try {
+  if (fs.existsSync(RUN_MARKER)) alert('restart', 'The bot restarted after an unexpected stop (a crash, or the computer lost power or restarted). It is running again now.');
+  fs.mkdirSync(path.dirname(RUN_MARKER), { recursive: true });
+  fs.writeFileSync(RUN_MARKER, new Date().toISOString());
+} catch { /* the marker is only a hint */ }
+const cleanStop = () => { try { fs.rmSync(RUN_MARKER, { force: true }); } catch { /* ignore */ } process.exit(0); };
+process.once('SIGINT', cleanStop);
+process.once('SIGTERM', cleanStop);
+process.once('SIGHUP', cleanStop); // the Terminal window was closed
 
 app.listen(PORT, () => {
   console.log(`simple-agent listening on port ${PORT} (local model: ${OLLAMA_MODEL}, ${store.list().length} registered chat(s), google: ${google ? 'on' : 'off'}, github: ${github ? 'on' : 'off'}, cloud model: ${aiModel ? 'available' : 'off'}, action log: ${actionLog.enabled ? 'on' : 'off'}, website linking: ${linker.enabled ? 'on' : 'off'}, sign-up approvals: ${signups.enabled && ADMIN_ID ? 'on' : 'off'}, bot: ${botUsername ? `@${botUsername}` : 'username unknown'})`);

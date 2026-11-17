@@ -5,6 +5,9 @@
 //   GET  /web/agents              the agents, what tools they could use, how many more are allowed
 //   POST /web/agents              build an agent from the form
 //   POST /web/agents/<id>/<run|pause|resume|delete|schedule|update>
+//   GET  /web/connections         which of Google / GitHub / own AI key are linked (yes/no only, never a token)
+//   POST /web/disconnect          { provider: google|github|model } unlink one (the website's confirm box is the "yes")
+//   POST /web/account/delete      { confirm: "DELETE" } delete the account and its data (see account.js)
 //
 // Same rules as the chat door: the login is checked with Supabase on every request, the person is whoever Supabase
 // says, only the website's own address may call it, and requests are rate limited. This file only does the
@@ -15,7 +18,7 @@ import { createLimiter } from './webchat.js';
 const ID_RE = /^a[0-9a-f]{4,12}$/;
 const VERBS = new Set(['run', 'pause', 'resume', 'delete', 'schedule', 'update']);
 
-export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {} }) {
+export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {}, onError = () => {} }) {
   const allowed = new Set([siteOrigin, ...extraOrigins].filter(Boolean));
   const userLimit = createLimiter({ max: perUserPerMinute });
   const ipLimit = createLimiter({ max: perIpPerMinute });
@@ -52,7 +55,8 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
       if (!tenant) return res.status(409).json({ error: 'not_linked' });
       req.tenant = tenant;
       next();
-    } catch {
+    } catch (err) {
+      try { onError('sign-in check', err); } catch { /* ignore */ }
       res.status(500).json({ error: 'something went wrong' });
     }
   };
@@ -62,12 +66,16 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
       res.status(out.status || 200).json(out.body ?? {});
     } catch (err) {
       console.error('[web api] failed:', err?.name || 'Error');
+      try { onError(req.path.split('/')[1] || 'api', err); } catch { /* ignore */ }
       res.status(500).json({ error: 'something went wrong' });
     }
   };
   const json = express.json({ limit: '8kb' });
 
-  router.options(['/schedule', '/schedule/event', '/agents', '/agents/:id/:verb'], cors, (_req, res) => res.status(204).end());
+  router.options(['/schedule', '/schedule/event', '/agents', '/agents/:id/:verb', '/connections', '/disconnect', '/account/delete'], cors, (_req, res) => res.status(204).end());
+  router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
+  router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));
+  router.post('/account/delete', cors, limitIp, json, who, run((req) => ops.deleteAccount(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
   router.get('/schedule', cors, limitIp, who, run((req) => ops.schedule(req.tenant, Math.min(42, Math.max(1, parseInt(req.query.days, 10) || 7)), /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from || '')) ? String(req.query.from) : null)));
   router.post('/schedule/event', cors, limitIp, json, who, run((req) => ops.addEvent(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
   router.get('/agents', cors, limitIp, who, run((req) => ops.agents(req.tenant)));
