@@ -13,7 +13,7 @@ const MAX_LEN = 120;
 
 const tidy = (v) => String(v).replace(/[\r\n\t]+/g, ' ').trim().slice(0, MAX_LEN);
 
-export function createLogger({ url, key, fetchImpl = globalThis.fetch, timeoutMs = 5000, maxBuffer = 200 } = {}) {
+export function createLogger({ url, key, fetchImpl = globalThis.fetch, timeoutMs = 5000, maxBuffer = 200, onError = () => {} } = {}) {
   // Accept the project URL with or without the "/rest/v1" tail that the dashboard's Data API page shows.
   const base = String(url || '').trim().replace(/\/+$/, '').replace(/\/rest\/v1$/i, '');
   const secret = String(key || '').trim();
@@ -62,6 +62,7 @@ export function createLogger({ url, key, fetchImpl = globalThis.fetch, timeoutMs
         } catch (err) {
           lastError = err.name === 'AbortError' ? 'log write timed out' : err.message;
           buffer = batch.concat(buffer).slice(-maxBuffer); // keep them for next time
+          try { onError(lastError); } catch { /* ignore */ }
           break;
         }
       }

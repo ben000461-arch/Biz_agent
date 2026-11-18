@@ -149,8 +149,54 @@ export function createStore(file) {
       if (!t) return false;
       if ('modelChoice' in patch) t.modelChoice = patch.modelChoice === null ? undefined : String(patch.modelChoice).slice(0, 40);
       if ('cloudOk' in patch) t.cloudOk = Boolean(patch.cloudOk);
+      if ('googleExpiredAt' in patch) t.googleExpiredAt = patch.googleExpiredAt ? String(patch.googleExpiredAt).slice(0, 40) : undefined; // their Google sign-in died; cleared on reconnect
       save();
       return true;
+    },
+
+    // Time zone (an IANA name like America/Chicago; the caller has checked it) and the most agents this business may have.
+    setTimezone(chatId, tz) {
+      const t = state.tenants[String(chatId)];
+      if (!t) return false;
+      t.tz = String(tz).slice(0, 60);
+      save();
+      return true;
+    },
+    setAgentCap(chatId, n) {
+      const t = state.tenants[String(chatId)];
+      if (!t) return false;
+      t.agentCap = Math.min(10, Math.max(1, Math.floor(Number(n)) || 3));
+      save();
+      return true;
+    },
+
+    // Agents (see agents.js). Only these few fields can ever be changed after creation.
+    agents(chatId) {
+      return state.tenants[String(chatId)]?.agents || [];
+    },
+    addAgent(chatId, agent, cap = 3) {
+      const t = state.tenants[String(chatId)];
+      if (!t) return { error: 'unknown' };
+      t.agents ||= [];
+      if (t.agents.length >= cap) return { error: 'cap' };
+      t.agents.push(agent);
+      save();
+      return { agent };
+    },
+    updateAgent(chatId, id, patch) {
+      const a = (state.tenants[String(chatId)]?.agents || []).find((x) => x.id === id);
+      if (!a) return null;
+      for (const k of ['name', 'purpose', 'info', 'tools', 'sheet', 'enabled', 'schedule', 'lastRunAt', 'armedAt', 'lastStatus', 'runs', 'briefed']) if (k in patch) a[k] = patch[k];
+      save();
+      return a;
+    },
+    removeAgent(chatId, id) {
+      const t = state.tenants[String(chatId)];
+      const before = t?.agents?.length || 0;
+      if (!before) return false;
+      t.agents = t.agents.filter((x) => x.id !== id);
+      save();
+      return t.agents.length < before;
     },
 
     setTools(chatId, groups) {

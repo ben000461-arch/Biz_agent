@@ -1,18 +1,21 @@
 // google.js — talks to Google on behalf of one business: the sign-in flow
-// (OAuth), creating Gmail drafts, and reading the calendar. Nothing here sends
+// (OAuth), creating Gmail drafts, reading the calendar and adding events the owner approved. Nothing here sends
 // email: the only Gmail permission asked for is "compose", and we only ever
 // create drafts that wait in the owner's Drafts folder.
 
 import crypto from 'crypto';
+import { zonedParts, zonedToUtc } from './when.js';
 
 export const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.compose',
-  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events', // read events, and add the ones the owner said yes to
 ];
 
 export class NeedsReconnect extends Error {}
+// the saved sign-in is fine but was granted before we asked for this permission (e.g. read-only calendar)
+export class NeedsMoreAccess extends Error {}
 
-export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases = {} }) {
+export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases = {}, onExpired = () => {} }) {
   const AUTH = bases.auth || 'https://accounts.google.com/o/oauth2/v2/auth';
   const TOKEN = bases.token || 'https://oauth2.googleapis.com/token';
   const REVOKE = bases.revoke || 'https://oauth2.googleapis.com/revoke';
@@ -45,6 +48,11 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
       signal: AbortSignal.timeout(20_000),
     });
     if (res.status === 401) throw new NeedsReconnect('Google rejected the saved sign-in');
+    if (res.status === 403) {
+      const body = await res.json().catch(() => ({}));
+      if (/insufficient|scope/i.test(JSON.stringify(body?.error || ''))) throw new NeedsMoreAccess('the saved sign-in lacks this permission');
+      throw new Error('Google API error 403');
+    }
     if (!res.ok) throw new Error(`Google API error ${res.status}`);
     return res.json();
   }
@@ -112,6 +120,7 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
         if (data.error === 'invalid_grant') {
           vault.remove(id, 'google');
           accessCache.delete(id);
+          try { onExpired(id); } catch { /* telling them must never break the caller */ }
           throw new NeedsReconnect('expired');
         }
         throw new Error('Could not refresh the Google sign-in');
@@ -153,12 +162,16 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
     async listEvents(chatId, when, tz) {
       const token = await this.accessToken(chatId);
       const now = new Date();
-      const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+      const startOfDay = (d) => {
+        if (tz) { const p = zonedParts(d, tz); return zonedToUtc({ y: p.y, m: p.m, d: p.d }, tz); } // the business's own midnight
+        const x = new Date(d); x.setHours(0, 0, 0, 0); return x;
+      };
+      const nextMidnight = (d) => startOfDay(new Date(startOfDay(d).getTime() + 30 * 36e5)); // 30h later is always tomorrow, even on clock-change days
       let from = now;
       let to;
-      if (when === 'tomorrow') { from = startOfDay(new Date(now.getTime() + 864e5)); to = new Date(from.getTime() + 864e5); }
+      if (when === 'tomorrow') { from = nextMidnight(now); to = nextMidnight(from); }
       else if (when === 'week') { to = new Date(now.getTime() + 7 * 864e5); }
-      else { to = new Date(startOfDay(now).getTime() + 864e5); }
+      else { to = nextMidnight(now); }
       const q = new URLSearchParams({ timeMin: from.toISOString(), timeMax: to.toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: '15' });
       const data = await googleFetch(`${CAL}/calendars/primary/events?${q}`, token);
       return (data.items || []).map((e) => ({
@@ -166,6 +179,32 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
         start: e.start?.dateTime || e.start?.date,
         allDay: Boolean(e.start?.date && !e.start?.dateTime),
       }));
+    },
+
+    // Events overlapping a window (to warn about a clash before booking).
+    async eventsBetween(chatId, fromISO, toISO, max = 10) {
+      const token = await this.accessToken(chatId);
+      const q = new URLSearchParams({ timeMin: new Date(fromISO).toISOString(), timeMax: new Date(toISO).toISOString(), singleEvents: 'true', orderBy: 'startTime', maxResults: String(Math.min(100, Math.max(1, max))) });
+      const data = await googleFetch(`${CAL}/calendars/primary/events?${q}`, token);
+      return (data.items || []).filter((e) => e.status !== 'cancelled').map((e) => ({
+        id: e.id,
+        title: e.summary || '(no title)',
+        start: e.start?.dateTime || e.start?.date,
+        end: e.end?.dateTime || e.end?.date,
+        allDay: Boolean(e.start?.date && !e.start?.dateTime),
+      }));
+    },
+
+    // Adds ONE event to the owner's main calendar. Only called after they said yes in chat.
+    async createEvent(chatId, { title, startISO, endISO, tz }) {
+      const token = await this.accessToken(chatId);
+      const clean = String(title || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200) || 'Event';
+      const when = (iso) => ({ dateTime: new Date(iso).toISOString(), ...(tz ? { timeZone: tz } : {}) });
+      return googleFetch(`${CAL}/calendars/primary/events`, token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary: clean, start: when(startISO), end: when(endISO) }),
+      });
     },
   };
 }
