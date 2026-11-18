@@ -37,6 +37,7 @@ import { createModelConnector, extractJson, PROVIDERS } from './models.js';
 import { createLogger } from './logger.js';
 import { createAlerts, redact } from './alerts.js';
 import { createAccounts } from './account.js';
+import { createNotes } from './notes.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -96,6 +97,8 @@ const TG = `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}`;
 const ADMIN_ID = (ADMIN_TELEGRAM_ID || '').trim();
 
 const store = createStore(TENANTS_FILE || path.join(__dirname, 'data', 'tenants.json'));
+// notes live next to tenants.json so they survive restarts (and are included in backups of data/)
+const notes = createNotes(process.env.NOTES_FILE || path.join(path.dirname(TENANTS_FILE || path.join(__dirname, 'data', 'tenants.json')), 'notes.json'));
 const workspacesRoot = WORKSPACES_DIR || path.join(__dirname, 'workspaces');
 
 // Action log: what the agent did (never what anyone said). Off unless both Supabase settings are present.
@@ -473,26 +476,36 @@ const desktopDir = () => path.join(os.homedir(), 'Desktop');
 // Where a business's files live. The admin keeps using the Desktop (so
 // everything you've already built still works); everyone else gets a private
 // folder named after their chat ID.
+// The owner's files used to go straight onto the real Desktop. Now they go to workspaces/owner by default;
+// OWNER_WORKSPACE=desktop in .env brings the old behaviour back, or set it to any folder path.
+const OWNER_WS = String(process.env.OWNER_WORKSPACE || '').trim();
+const ownerOnDesktop = OWNER_WS.toLowerCase() === 'desktop';
+function ownerDir() {
+  if (ownerOnDesktop) return desktopDir();
+  if (OWNER_WS) return path.resolve(OWNER_WS.replace(/^~(?=\/|$)/, os.homedir()));
+  return path.join(workspacesRoot, 'owner');
+}
 function workspaceFor(tenant) {
-  const dir = tenant.isAdmin ? desktopDir() : path.join(workspacesRoot, String(tenant.chatId));
+  const dir = tenant.isAdmin ? ownerDir() : path.join(workspacesRoot, String(tenant.chatId));
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
-const where = (tenant) => (tenant.isAdmin ? 'your Desktop' : 'your workspace');
-
-const notesByTenant = new Map();
+const where = (tenant) => (tenant.isAdmin && ownerOnDesktop ? 'your Desktop' : 'your workspace');
 
 function addNote(tenant, text) {
-  const notes = notesByTenant.get(tenant.chatId) || [];
-  notes.push({ text, at: new Date().toISOString() });
-  notesByTenant.set(tenant.chatId, notes);
-  return `Got it, saved 👍 That's ${notes.length} note${notes.length === 1 ? '' : 's'} total now.`;
+  let count;
+  try { count = notes.add(tenant.chatId, text); } catch (err) {
+    console.error('[notes] could not save:', err?.code || err?.name || 'Error');
+    alert('notes-save', "A note couldn't be saved to disk (check free space and folder permissions).");
+    return "Sorry, I couldn't save that note just now. Nothing was saved, so please try again in a minute.";
+  }
+  return `Got it, saved 👍 That's ${count} note${count === 1 ? '' : 's'} total now.`;
 }
 
 function listNotes(tenant) {
-  const notes = notesByTenant.get(tenant.chatId) || [];
-  if (notes.length === 0) return "You don't have any notes saved yet.";
-  return notes.map((n, i) => `${i + 1}. ${n.text}`).join('\n');
+  const list = notes.list(tenant.chatId);
+  if (list.length === 0) return "You don't have any notes saved yet.";
+  return list.map((n, i) => `${i + 1}. ${n.text}`).join('\n');
 }
 
 async function getWeather(location) {
@@ -707,7 +720,8 @@ async function deleteAccount(tenant, via) {
   try { if (github) await github.disconnect(chatId); } catch { /* keep going */ }
   try { if (aiModel) aiModel.disconnectOwn(chatId); } catch { /* keep going */ }
   try { vault?.removeAll(chatId); } catch { /* keep going */ }
-  for (const m of [pendingActions, notesByTenant, agentDrafts, manualRuns, bookingAsks, deleteAsks, eventPolledAt]) { try { m.delete(chatId); } catch { /* ignore */ } }
+  try { notes.remove(chatId); } catch { /* keep going */ }
+  for (const m of [pendingActions, agentDrafts, manualRuns, bookingAsks, deleteAsks, eventPolledAt]) { try { m.delete(chatId); } catch { /* ignore */ } }
   resetMemory(chatId);
   const ws = path.resolve(workspacesRoot, chatId);
   if (ws.startsWith(path.resolve(workspacesRoot) + path.sep)) { try { fs.rmSync(ws, { recursive: true, force: true }); } catch { /* reported below */ } }
@@ -2170,7 +2184,7 @@ async function handleCommand({ chatId, text, isAdmin }) {
         if (github) await github.disconnect(arg);
         if (aiModel) aiModel.disconnectOwn(arg);
         pendingActions.delete(String(arg));
-        notesByTenant.delete(String(arg));
+        try { notes.remove(String(arg)); } catch { /* ignore */ }
       }
       await sendTelegramMessage(chatId, ok
         ? `Removed. Their files are still on disk in workspaces/${arg} — nothing was deleted.`

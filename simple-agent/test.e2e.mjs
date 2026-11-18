@@ -75,7 +75,7 @@ function startApp() {
     env: {
       ...process.env,
       SUPABASE_URL: '', SUPABASE_SERVICE_KEY: '', GROQ_API_KEY: '', // tests never touch your real Supabase or Groq
-      HOME: path.join(tmp, 'home'),
+      HOME: path.join(tmp, 'home'), OWNER_WORKSPACE: 'desktop',
       TELEGRAM_BOT_TOKEN: 'TESTTOKEN',
       ADMIN_TELEGRAM_ID: '111',
       TELEGRAM_WEBHOOK_SECRET: 'sekret',
