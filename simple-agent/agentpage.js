@@ -16,8 +16,10 @@ export const MAX_STEPS = 20;
 const MAX_ELEMENTS = 300;
 const MAX_TEXT = 6000;
 const MAX_VALUE = 2000;
-const KINDS = new Set(['field', 'textarea', 'select', 'checkbox', 'radio', 'button', 'link']);
-const ACTIONS = { fill: ['field', 'textarea'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
+const MAX_HISTORY = 6;
+// "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
+const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link']);
+const ACTIONS = { fill: ['field', 'textarea', 'document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
 
 const clip = (s, n) => String(s ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').slice(0, n);
 
@@ -67,7 +69,16 @@ export function cleanSnapshot(raw) {
   };
 }
 
-export function planPrompt(snapshot, request) {
+// The last few messages of this chat, so a follow-up like "how about now" or "make it shorter" makes sense.
+// Only what the employee typed and what Agent said back; masked and capped. Never page content.
+export function cleanHistory(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(-MAX_HISTORY)
+    .filter((h) => h && (h.who === 'you' || h.who === 'agent') && String(h.text ?? '').trim())
+    .map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
+}
+
+export function planPrompt(snapshot, request, history = []) {
   const list = snapshot.elements.map((e) => {
     let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''} | "${e.label}"`;
     if (e.value) line += ` | now: "${e.value}"`;
@@ -82,7 +93,9 @@ You get the page's visible text and a numbered list of things you can act on. Pl
 Rules:
 - Use ONLY the element ids listed (like "e7"). Never invent ids.
 - Actions: "fill" (type text into a field), "select" (pick one of the listed options, exactly as written), "check"/"uncheck" (checkboxes), "click" (buttons and links).
-- Take values from the page text or the request. Never make up facts (names, numbers, dates) that aren't there; leave that field out and say so.
+- Take values from the page text or the request. Never make up facts about real people or records (names, numbers, dates, account details) that aren't there; leave that field out and say so.
+- When the employee asks you to WRITE something (a sentence, a paragraph, a note, a reply), compose it yourself and put the finished text in the "fill" value.
+- A "document" element is the body of an editor like Google Docs. "fill" on it types the text where the cursor is; it does not replace what's already there.
 - Do not click buttons that pay, delete, or send something unless the employee clearly asked for that.
 - At most ${MAX_STEPS} steps, in order. If the task can't be done on this page, return no steps and explain briefly.
 - "say" is one or two short, plain sentences telling the employee what you'll do (or why you can't).
@@ -96,7 +109,7 @@ ${snapshot.text || '(none)'}
 Things you can act on:
 ${list || '(nothing)'}
 
-The employee asked: ${clip(request, 1000)}`;
+${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}The employee asked: ${clip(request, 1000)}`;
   return { system, user };
 }
 
