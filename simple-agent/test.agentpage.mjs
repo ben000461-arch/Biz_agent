@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { cleanSnapshot, cleanHistory, checkPlan, maskSensitive, planPrompt, MAX_STEPS } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, cleanStyle, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ''}`); } };
@@ -61,15 +61,42 @@ console.log('\n[unit]');
   check('a document element is kept', docs.ok && docs.snapshot.elements[0].kind === 'document');
   const dp = checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'Cars turn fuel into motion.' }, { do: 'select', id: 'e1', value: 'x' }, { do: 'check', id: 'e1' }] }, docs.snapshot);
   check('you can type into a document, nothing else', dp.steps.length === 1 && dp.steps[0].do === 'fill' && dp.steps[0].kind === 'document' && dp.dropped.length === 2, JSON.stringify(dp));
-  check('the prompt explains documents and allows writing', /"document" element/.test(planPrompt(docs.snapshot, 'write a sentence').system) && /WRITE/.test(planPrompt(docs.snapshot, 'x').system));
+  check('the prompt explains documents and allows writing', /kind "document"/.test(planPrompt(docs.snapshot, 'write a sentence').system) && /WRITE/.test(planPrompt(docs.snapshot, 'x').system));
 
   // replace / clear / spacing on documents only
   const dp2 = checkPlan({ steps: [{ do: 'replace', id: 'e1', value: '# Cars\n\nPara one.\n\nPara two.', spacing: 'double' }, { do: 'clear', id: 'e1' }, { do: 'replace', id: 'e1', value: '' }, { do: 'clear', id: 'e2' }] }, docs.snapshot);
   check('replace and clear work on a document', dp2.steps.map((s) => s.do).join() === 'replace,clear' && dp2.dropped.length === 2, JSON.stringify(dp2));
-  check('line breaks and double spacing are kept', dp2.steps[0].value.includes('\n\nPara one.') && dp2.steps[0].spacing === 'double');
+  check('line breaks and double spacing are kept', dp2.steps[0].value.includes('\n\nPara one.') && dp2.steps[0].style?.spacing === 'double');
   check('a long essay fits in a document', checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'x'.repeat(9000) }] }, docs.snapshot).steps[0].value.length === 9000);
   check('replace/clear never work on normal fields', checkPlan({ steps: [{ do: 'replace', id: 'e1', value: 'x' }, { do: 'clear', id: 'e2' }] }, c.snapshot).steps.length === 0);
-  check('spacing is ignored outside documents', !('spacing' in checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'x', spacing: 'double' }] }, c.snapshot).steps[0]));
+  check('style is ignored outside documents', !('style' in checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'x', style: { spacing: 'double' } }] }, c.snapshot).steps[0]));
+
+  // style: only known settings with sane values
+  const st = checkPlan({ steps: [{ do: 'replace', id: 'e1', value: 'x', style: { font: 'Times New Roman', size: 12, spacing: '1.5', indent: true, align: 'justify', color: 'red' } }] }, docs.snapshot).steps[0].style;
+  check('style keeps font, size, spacing, indent, align', JSON.stringify(st) === JSON.stringify({ font: 'Times New Roman', size: 12, spacing: '1.5', indent: true, align: 'justify' }), JSON.stringify(st));
+  const bad = cleanStyle({ font: 'x;}<script>', size: 400, spacing: 'triple', indent: 'yes', align: 'middle' });
+  check('bad style values are dropped (no CSS tricks)', bad === null, JSON.stringify(bad));
+
+  // undo
+  const u = checkPlan({ steps: [{ do: 'undo', id: 'e1', value: 'all' }, { do: 'undo', id: 'e1' }, { do: 'undo', id: 'e2' }] }, docs.snapshot);
+  check('undo works on documents: "all" or "last"', u.steps.map((x) => x.value).join() === 'all,last' && u.dropped.length === 1);
+  check('undoing the last change may run on its own; undo-all asks', checkPlan({ steps: [{ do: 'undo', id: 'e1' }] }, docs.snapshot).auto === true && checkPlan({ steps: [{ do: 'undo', id: 'e1', value: 'all' }] }, docs.snapshot).auto === false);
+
+  // menus, tabs, empty documents
+  const tools = cleanSnapshot({ url: 'https://app.example.com/x', title: 'App', text: '', elements: [
+    { id: 'e1', kind: 'document', label: 'Body', empty: true }, { id: 'e2', kind: 'button', label: 'Insert', role: 'menuitem', popup: true },
+    { id: 'e3', kind: 'button', label: 'Delete', role: 'menuitem' }, { id: 'e4', kind: 'button', label: 'Settings', role: 'tab' }, { id: 'e5', kind: 'button', label: 'Odd', role: 'evil' }] }).snapshot;
+  check('menus and tabs keep their role and "opens a menu"', tools.elements[1].role === 'menuitem' && tools.elements[1].popup === true && tools.elements[4].role === undefined);
+  check('the prompt lists menus and empty documents', /\(menuitem\) \| "Insert" \| opens a menu/.test(planPrompt(tools, 'x').user) && /"Body" \| empty/.test(planPrompt(tools, 'x').user));
+  check('opening a menu or tab runs on its own', checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'click', id: 'e4' }] }, tools).auto === true);
+  check('picking a real menu item (Delete) asks first', checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'click', id: 'e3' }] }, tools).auto === false);
+  check('writing into an EMPTY document runs on its own', checkPlan({ steps: [{ do: 'replace', id: 'e1', value: 'Hi' }] }, tools).auto === true);
+
+  // look again (multi-step tasks)
+  check('"more" passes through when there are steps', checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, 1).more === true);
+  check('no "more" without steps', checkPlan({ more: true, steps: [] }, tools, 1).more === false);
+  check(`at most ${MAX_ROUNDS} looks`, checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, MAX_ROUNDS).more === false);
+  check('the prompt says which look it is, and when it is the last', /look 2 of at most/.test(planPrompt(tools, 'x', [], 2).system) && /LAST look/.test(planPrompt(tools, 'x', [], MAX_ROUNDS).system) && /Look 2: you already did/.test(planPrompt(tools, 'x', [], 2).user));
   check('the prompt explains replace vs add', /"replace" swaps the WHOLE document/.test(planPrompt(docs.snapshot, 'x').system));
 
   // which plans may run on their own (decided here, never by the model)
@@ -170,6 +197,8 @@ try {
   check('works from the extension origin (CORS)', r.acao === EXT);
   prompts.length = 0;
   r = await call('/web/agent/plan', { body: { request: 'how about now', page: PAGE, history: [{ who: 'you', text: 'write about cars' }, { who: 'agent', text: 'No text box found.' }] } });
+  r = await call('/web/agent/plan', { body: { request: 'x', page: PAGE, round: 99 } });
+  check('the route caps the look number', r.status === 200 && r.body.round === MAX_ROUNDS && r.body.more === false);
   check('the route passes chat history to the model', r.status === 200 && /Earlier in this chat:[\s\S]*write about cars/.test(prompts[0] || ''));
   modelMode = 'down';
   r = await call('/web/agent/plan', { body: { request: 'Fill it', page: PAGE } });

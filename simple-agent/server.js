@@ -38,7 +38,7 @@ import { createLogger } from './logger.js';
 import { createAlerts, redact } from './alerts.js';
 import { createAccounts } from './account.js';
 import { createNotes } from './notes.js';
-import { cleanSnapshot, cleanHistory, planPrompt, checkPlan } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, planPrompt, checkPlan, MAX_ROUNDS } from './agentpage.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -2566,15 +2566,16 @@ const webOps = {
     const rl = entitlements.enabled ? meter.allowMessage(tenant.chatId, ent?.plan?.perMinute) : { ok: true };
     if (!rl.ok) return { status: 429, body: { error: 'slow', message: 'Slow down a little and try again in a minute.' } };
     const ctx = { tenant, ent };
-    const { system, user } = planPrompt(c.snapshot, request, cleanHistory(b.history));
+    const round = Math.max(1, Math.min(MAX_ROUNDS, Number.parseInt(b.round, 10) || 1));
+    const { system, user } = planPrompt(c.snapshot, request, cleanHistory(b.history), round);
     let data;
     try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
       return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
     }
-    const plan = checkPlan(data, c.snapshot);
+    const plan = checkPlan(data, c.snapshot, round);
     logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
     const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
-    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, ...(warn ? { warning: warn } : {}) } };
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, ...(warn ? { warning: warn } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
   async agentLog(tenant, b) {
