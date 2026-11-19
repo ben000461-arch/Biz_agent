@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { cleanSnapshot, cleanHistory, cleanStyle, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ''}`); } };
@@ -76,6 +76,16 @@ console.log('\n[unit]');
   check('style keeps font, size, spacing, indent, align', JSON.stringify(st) === JSON.stringify({ font: 'Times New Roman', size: 12, spacing: '1.5', indent: true, align: 'justify' }), JSON.stringify(st));
   const bad = cleanStyle({ font: 'x;}<script>', size: 400, spacing: 'triple', indent: 'yes', align: 'middle' });
   check('bad style values are dropped (no CSS tricks)', bad === null, JSON.stringify(bad));
+  check('"indent": false is kept (to remove indents)', cleanStyle({ indent: false }).indent === false);
+
+  // the document's current look goes to the model, so new text can match it
+  const styled = cleanSnapshot({ url: 'https://docs.google.com/document/d/x/edit', title: 'Doc', text: 'Hi', elements: [{ id: 'e1', kind: 'document', label: 'Document', value: 'Hi', style: { font: 'Times New Roman', size: 12, spacing: 'double', indent: false, evil: 'x' } }], frames: [{ label: 'Google Images', host: 'images.google.com' }, { label: '<b>x</b> 123-45-6789', host: 'Bad Host!' }, 'nope'] }).snapshot;
+  check('document style is cleaned and kept', JSON.stringify(styled.elements[0].style) === JSON.stringify({ font: 'Times New Roman', size: 12, spacing: 'double', indent: false }));
+  const sp = planPrompt(styled, 'add a sentence');
+  check('the prompt shows the current style and says new text matches it', /current style: \{"font":"Times New Roman"/.test(sp.user) && /automatically matches the document's current style/.test(sp.system));
+  check('walled-off panels are listed (cleaned, masked)', styled.frames.length === 2 && styled.frames[0].host === 'images.google.com' && styled.frames[1].host === 'badhost' && !/123-45-6789/.test(JSON.stringify(styled.frames)) && /Panels you can't see inside: "Google Images" \(images\.google\.com\)/.test(sp.user));
+  check('no panels, no panel line', !/Panels you can't see/.test(planPrompt(docs.snapshot, 'x').user));
+  check('the prompt: expand/continue means add, never show ids, restyle by replacing', /"expand", "continue", "keep going"/.test(sp.system) && /never mention element ids/.test(sp.system) && /Don't click toolbar formatting buttons/.test(sp.system));
 
   // undo
   const u = checkPlan({ steps: [{ do: 'undo', id: 'e1', value: 'all' }, { do: 'undo', id: 'e1' }, { do: 'undo', id: 'e2' }] }, docs.snapshot);
@@ -91,6 +101,36 @@ console.log('\n[unit]');
   check('opening a menu or tab runs on its own', checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'click', id: 'e4' }] }, tools).auto === true);
   check('picking a real menu item (Delete) asks first', checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'click', id: 'e3' }] }, tools).auto === false);
   check('writing into an EMPTY document runs on its own', checkPlan({ steps: [{ do: 'replace', id: 'e1', value: 'Hi' }] }, tools).auto === true);
+
+  // search boxes: fill, then press Enter
+  const srch = cleanSnapshot({ url: 'https://www.youtube.com/', title: 'YouTube', text: '', elements: [
+    { id: 'e1', kind: 'field', label: 'Search', search: true }, { id: 'e2', kind: 'field', label: 'Email' }, { id: 'e3', kind: 'button', label: 'Search', search: true }] }).snapshot;
+  check('search boxes are marked (fields only)', srch.elements[0].search === true && !srch.elements[2].search && /"Search" \| search box/.test(planPrompt(srch, 'x').user));
+  check('"submit" presses Enter in fields only', checkPlan({ steps: [{ do: 'submit', id: 'e1' }, { do: 'submit', id: 'e3' }] }, srch).steps.length === 1);
+  check('searching runs on its own; Enter in another field asks', checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'gta 6' }, { do: 'submit', id: 'e1' }] }, srch).auto === true && checkPlan({ steps: [{ do: 'submit', id: 'e2' }] }, srch).auto === false);
+  check('the prompt says search = fill then submit', /"fill" the search box, then "submit" it/.test(planPrompt(srch, 'x').system) && /Text box/.test(planPrompt(srch, 'x').system));
+
+  // writing at a spot in a document (answers under questions, filling blanks)
+  const ins = checkPlan({ steps: [
+    { do: 'insert', id: 'e1', find: 'the end of the month?', value: 'Answer: $4,556.53' },
+    { do: 'insert', id: 'e1', find: 'a. ________', value: 'a. $642.79', swap: true },
+    { do: 'insert', id: 'e1', find: 'Name: ____', value: 'x\ny', swap: true },
+    { do: 'insert', id: 'e1', find: '', value: 'x' }, { do: 'insert', id: 'e2', find: 'x', value: 'y' }] }, docs.snapshot);
+  check('insert needs a spot and text, documents only', ins.steps.length === 3 && ins.dropped.length === 2, JSON.stringify(ins.dropped));
+  check('inserted text is one line', ins.steps[2].value === 'x y');
+  check('adding after text or filling a blank runs on its own', checkPlan({ steps: [ins.steps[0], ins.steps[1]] }, docs.snapshot).auto === true);
+  check('swapping real text (not a blank) asks first', checkPlan({ steps: [{ do: 'insert', id: 'e1', find: 'Cars use engines.', value: 'Bikes', swap: true }] }, docs.snapshot).auto === false);
+  check('the prompt explains insert, NEW items, choices, and not inventing personal answers', /"insert" writes your text AT A SPOT/.test(planPrompt(docs.snapshot, 'x').system) && /marked NEW/.test(planPrompt(docs.snapshot, 'x').system) && /"Question: option"/.test(planPrompt(docs.snapshot, 'x').system) && /Never make up answers about the employee themselves/.test(planPrompt(docs.snapshot, 'x').system));
+  const fresh = cleanSnapshot({ url: 'https://mail.google.com/', title: 'Mail', text: '', elements: [{ id: 'e1', kind: 'field', label: 'To', fresh: true }] }).snapshot;
+  check('NEW items are marked for the model', fresh.elements[0].fresh === true && /"To" \| NEW/.test(planPrompt(fresh, 'x').user));
+
+  // math check
+  check('wrong math is caught (words between numbers are fine)', checkMath('starting $3,278.91 + deposits $2,166.68 – checks $877.06 – fee $12.00 = $3,578.53')[0] === 'it says 3,578.53, but it works out to 4,556.53');
+  check('right math passes', checkMath('$3,278.91 + $2,166.68 - $877.06 - $12.00 = $4,556.53').length === 0 && checkMath('976.15 + 512.00 - 845.36 = 642.79').length === 0);
+  check('× and ÷ come first', checkMath('2 x 3 + 4 = 10').length === 0 && checkMath('2 + 3 × 4 = 20').length === 1);
+  check('phone numbers and dates are not math', checkMath('call 951-555-0134 on 2026-11-18').length === 0);
+  const badMath = checkPlan({ steps: [{ do: 'insert', id: 'e1', find: 'the end of the month?', value: '3,278.91 + 2,166.68 = 5,000.00' }] }, docs.snapshot);
+  check('a plan with wrong math is flagged and never runs on its own', badMath.mathWarnings.length === 1 && badMath.auto === false);
 
   // look again (multi-step tasks)
   check('"more" passes through when there are steps', checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, 1).more === true);
@@ -136,6 +176,7 @@ const ollama = http.createServer(async (req, res) => {
   const user = body.messages[body.messages.length - 1].content;
   prompts.push(user);
   if (modelMode === 'down') { res.statusCode = 500; return res.end('{}'); }
+  if (modelMode === 'math') return json(res, 200, { message: { content: JSON.stringify({ say: 'Notes.', steps: [{ do: 'fill', id: 'e2', value: '10 + 5 = 16' }] }) } });
   const out = { say: 'I’ll fill in the client details.', steps: [{ do: 'fill', id: 'e1', value: 'Maria Lopez' }, { do: 'fill', id: 'e77', value: 'ghost' }, { do: 'click', id: 'e5' }] };
   json(res, 200, { message: { content: JSON.stringify(out) } });
 });
@@ -200,6 +241,9 @@ try {
   r = await call('/web/agent/plan', { body: { request: 'x', page: PAGE, round: 99 } });
   check('the route caps the look number', r.status === 200 && r.body.round === MAX_ROUNDS && r.body.more === false);
   check('the route passes chat history to the model', r.status === 200 && /Earlier in this chat:[\s\S]*write about cars/.test(prompts[0] || ''));
+  modelMode = 'math';
+  r = await call('/web/agent/plan', { body: { request: 'x', page: PAGE } });
+  check('the route warns about wrong math and makes it wait for approval', r.status === 200 && /Check this math/.test(r.body.warning || '') && /works out to 15\.00/.test(r.body.warning) && r.body.auto === false, JSON.stringify(r.body));
   modelMode = 'down';
   r = await call('/web/agent/plan', { body: { request: 'Fill it', page: PAGE } });
   check('model down -> 503, "nothing was changed"', r.status === 503 && /Nothing was changed/.test(r.body.message));

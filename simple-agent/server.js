@@ -2575,7 +2575,8 @@ const webOps = {
     const plan = checkPlan(data, c.snapshot, round);
     logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
     const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
-    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, ...(warn ? { warning: warn } : {}) } };
+    const warning = [...plan.mathWarnings, ...(warn ? [warn] : [])].join(' ') || undefined;
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, ...(warning ? { warning } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
   async agentLog(tenant, b) {
