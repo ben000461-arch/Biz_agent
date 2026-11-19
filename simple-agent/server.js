@@ -2574,7 +2574,7 @@ const webOps = {
     const plan = checkPlan(data, c.snapshot);
     logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
     const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
-    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, ...(warn ? { warning: warn } : {}) } };
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, ...(warn ? { warning: warn } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
   async agentLog(tenant, b) {
@@ -2585,7 +2585,7 @@ const webOps = {
     const n = (x) => Math.max(0, Math.min(99, Number.parseInt(x, 10) || 0));
     logEvent(tenant, {
       kind: 'action', action: 'agent_page', status: outcome === 'done' ? 'done' : outcome === 'cancelled' ? 'cancelled' : 'failed',
-      detail: `${host || 'page'} · ${n(b.done)}/${n(b.total)} step${n(b.total) === 1 ? '' : 's'} done${outcome === 'cancelled' ? ' (cancelled)' : ''}`,
+      detail: `${host || 'page'} · ${n(b.done)}/${n(b.total)} step${n(b.total) === 1 ? '' : 's'} done${outcome === 'cancelled' ? ' (cancelled)' : ''}${b.auto === true ? ' (ran on its own)' : ''}`,
     });
     return { body: { ok: true } };
   },

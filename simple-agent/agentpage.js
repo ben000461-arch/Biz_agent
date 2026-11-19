@@ -16,10 +16,13 @@ export const MAX_STEPS = 20;
 const MAX_ELEMENTS = 300;
 const MAX_TEXT = 6000;
 const MAX_VALUE = 2000;
+const MAX_DOC_VALUE = 12000; // a whole essay can go into a document
+export const AUTO_MAX_STEPS = 6;
 const MAX_HISTORY = 6;
 // "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
 const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link']);
-const ACTIONS = { fill: ['field', 'textarea', 'document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
+// fill on a document = write at the cursor; replace = swap the whole document for new text; clear = empty it
+const ACTIONS = { fill: ['field', 'textarea', 'document'], replace: ['document'], clear: ['document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
 
 const clip = (s, n) => String(s ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').slice(0, n);
 
@@ -98,9 +101,18 @@ Rules:
 - A "document" element is the body of an editor like Google Docs. "fill" on it types the text where the cursor is; it does not replace what's already there.
 - Do not click buttons that pay, delete, or send something unless the employee clearly asked for that.
 - At most ${MAX_STEPS} steps, in order. If the task can't be done on this page, return no steps and explain briefly.
+- Think about what the employee actually wants before planning. Read what's already on the page or in the document.
 - "say" is one or two short, plain sentences telling the employee what you'll do (or why you can't).
 
-Respond ONLY with JSON: {"say": string, "steps": [{"do": "fill"|"select"|"check"|"uncheck"|"click", "id": string, "value": string|null}]}`;
+Documents (an element with kind "document", like a Google Doc; its current text is shown under "Visible text"):
+- "fill" adds text where the cursor is. Use it to ADD something new.
+- "replace" swaps the WHOLE document for your text. Use it to rewrite, reformat, shorten, fix or turn the existing text into something else (for example "turn it into an essay"). Include everything that should remain.
+- "clear" deletes everything in the document (no value).
+- Format document text like this: a line starting with "# " is the title, "## " is a heading, and a blank line separates paragraphs. Never run paragraphs together.
+- If they ask for double spacing, add "spacing": "double" to that step.
+- You can't change fonts, colors or highlighting yet; say so instead of clicking toolbar buttons.
+
+Respond ONLY with JSON: {"say": string, "steps": [{"do": "fill"|"replace"|"clear"|"select"|"check"|"uncheck"|"click", "id": string, "value": string|null, "spacing": "double"|null}]}`;
   const user = `Page: ${snapshot.title} (${snapshot.host})
 
 Visible text:
@@ -127,9 +139,10 @@ export function checkPlan(data, snapshot) {
     if (!el) { dropped.push(`unknown element "${clip(s?.id, 12)}"`); continue; }
     if (!ACTIONS[action].includes(el.kind)) { dropped.push(`can't ${action} ${el.kind} "${el.label}"`); continue; }
     const step = { do: action, id: el.id, label: el.label || el.kind, kind: el.kind };
-    if (action === 'fill') {
+    if (action === 'fill' || action === 'replace') {
       if (s.value == null || String(s.value).trim() === '') { dropped.push(`no value for "${el.label}"`); continue; }
-      step.value = clip(s.value, MAX_VALUE);
+      step.value = clip(s.value, el.kind === 'document' ? MAX_DOC_VALUE : MAX_VALUE);
+      if (el.kind === 'document' && s.spacing === 'double') step.spacing = 'double';
     }
     if (action === 'select') {
       const want = String(s.value ?? '').trim().toLowerCase();
@@ -139,6 +152,15 @@ export function checkPlan(data, snapshot) {
     }
     steps.push(step);
   }
+  // Small, easy-to-undo tasks may run without a click (if the employee turned that on). Decided HERE from the
+  // steps themselves, never by the model: only filling empty fields, picking options, ticking boxes and adding
+  // text to a document, at most AUTO_MAX_STEPS steps. Clicking anything, replacing or clearing a document, or
+  // overwriting something already filled in always waits for approval.
+  const auto = steps.length > 0 && steps.length <= AUTO_MAX_STEPS && steps.every((st) => {
+    const el = byId.get(st.id);
+    if (st.do === 'fill') return el.kind === 'document' || !el.value;
+    return st.do === 'select' || st.do === 'check' || st.do === 'uncheck';
+  });
   const say = clip(data?.say, 400).trim() || (steps.length ? `I'll do ${steps.length} step${steps.length === 1 ? '' : 's'} on this page.` : "I couldn't find a way to do that on this page.");
-  return { say, steps, dropped };
+  return { say, steps, dropped, auto };
 }
