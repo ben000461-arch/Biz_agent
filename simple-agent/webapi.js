@@ -8,6 +8,8 @@
 //   GET  /web/connections         which of Google / GitHub / own AI key are linked (yes/no only, never a token)
 //   POST /web/disconnect          { provider: google|github|model } unlink one (the website's confirm box is the "yes")
 //   POST /web/account/delete      { confirm: "DELETE" } delete the account and its data (see account.js)
+//   POST /web/agent/plan          { request, page } plan steps for the Agent extension (see agentpage.js)
+//   POST /web/agent/log           { url, outcome, done, total } what happened after the plan (counts only)
 //
 // Same rules as the chat door: the login is checked with Supabase on every request, the person is whoever Supabase
 // says, only the website's own address may call it, and requests are rate limited. This file only does the
@@ -73,6 +75,20 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
   const json = express.json({ limit: '8kb' });
 
   router.options(['/schedule', '/schedule/event', '/agents', '/agents/:id/:verb', '/connections', '/disconnect', '/account/delete'], cors, (_req, res) => res.status(204).end());
+  // The "Agent" browser extension calls these from its background worker (origin chrome-extension://<id>).
+  // The login token is what authorises the call, same as the website; the origin check only keeps other websites out.
+  const extIds = String(process.env.AGENT_EXTENSION_IDS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const corsAgent = (req, res, next) => {
+    const origin = req.get('origin');
+    const ext = /^chrome-extension:\/\/([a-p]{32})$/.exec(origin || '');
+    if (origin && !(allowed.has(origin) || (ext && (!extIds.length || extIds.includes(ext[1]))))) return res.status(403).json({ error: 'origin not allowed' });
+    if (origin) res.set({ 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Headers': 'authorization, content-type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Max-Age': '600', Vary: 'Origin' });
+    next();
+  };
+  const bigJson = express.json({ limit: '256kb' }); // a page snapshot is bigger than a normal request
+  router.options(['/agent/plan', '/agent/log'], corsAgent, (_req, res) => res.status(204).end());
+  router.post('/agent/plan', corsAgent, limitIp, bigJson, who, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
+  router.post('/agent/log', corsAgent, limitIp, json, who, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
   router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
   router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));
   router.post('/account/delete', cors, limitIp, json, who, run((req) => ops.deleteAccount(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));

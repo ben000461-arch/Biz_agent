@@ -38,6 +38,7 @@ import { createLogger } from './logger.js';
 import { createAlerts, redact } from './alerts.js';
 import { createAccounts } from './account.js';
 import { createNotes } from './notes.js';
+import { cleanSnapshot, planPrompt, checkPlan } from './agentpage.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -2553,6 +2554,41 @@ const RECONNECT = { status: 409, body: { error: 'reconnect', message: 'Your Goog
 const bad = (message) => ({ status: 400, body: { error: 'invalid', message } });
 
 const webOps = {
+  // The "Agent" browser extension: plan steps for the page the employee is on (nothing runs until they approve).
+  async agentPlan(tenant, b) {
+    const request = String(b.request || '').trim();
+    if (!request) return { status: 400, body: { error: 'empty', message: 'Type what you want done on this page.' } };
+    if (request.length > 1000) return { status: 400, body: { error: 'too_long', message: 'That request is too long. Keep it under 1,000 characters.' } };
+    const c = cleanSnapshot(b.page);
+    if (!c.ok) return { status: 400, body: { error: 'page', message: "I can't work on this kind of page." } };
+    const ent = await entFor(tenant);
+    if (ent && !ent.canUse) return pausedBody(ent);
+    const rl = entitlements.enabled ? meter.allowMessage(tenant.chatId, ent?.plan?.perMinute) : { ok: true };
+    if (!rl.ok) return { status: 429, body: { error: 'slow', message: 'Slow down a little and try again in a minute.' } };
+    const ctx = { tenant, ent };
+    const { system, user } = planPrompt(c.snapshot, request);
+    let data;
+    try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
+      return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
+    }
+    const plan = checkPlan(data, c.snapshot);
+    logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
+    const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, ...(warn ? { warning: warn } : {}) } };
+  },
+  // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
+  async agentLog(tenant, b) {
+    const outcome = ['done', 'partial', 'failed', 'cancelled'].includes(b.outcome) ? b.outcome : null;
+    if (!outcome) return { status: 400, body: { error: 'invalid' } };
+    let host = '';
+    try { host = new URL(String(b.url || '')).hostname; } catch { host = ''; }
+    const n = (x) => Math.max(0, Math.min(99, Number.parseInt(x, 10) || 0));
+    logEvent(tenant, {
+      kind: 'action', action: 'agent_page', status: outcome === 'done' ? 'done' : outcome === 'cancelled' ? 'cancelled' : 'failed',
+      detail: `${host || 'page'} · ${n(b.done)}/${n(b.total)} step${n(b.total) === 1 ? '' : 's'} done${outcome === 'cancelled' ? ' (cancelled)' : ''}`,
+    });
+    return { body: { ok: true } };
+  },
   // what is linked, for the Tools page (never a token, only yes/no and a name)
   async connections(tenant) {
     const id = tenant.chatId;
