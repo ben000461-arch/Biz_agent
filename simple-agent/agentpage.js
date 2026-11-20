@@ -95,9 +95,14 @@ export function cleanHistory(raw) {
     .map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
 }
 
-export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false } = {}) {
-  const list = snapshot.elements.map((e) => {
-    let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''}${e.role ? ` (${e.role})` : ''} | "${e.label}"`;
+// How much page we hand the model in one request. Hosted models cap how much they read per minute (Groq's free
+// plan especially), and a busy page like an inbox easily blows past that. The extension already puts the most
+// useful things first (new, on screen); we keep as many as fit and say how many were left out.
+export const PROMPT_BUDGET = { text: 2500, user: 9000 }; // characters (about 4 per token)
+
+export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET } = {}) {
+  const lines = snapshot.elements.map((e) => {
+    let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''}${e.role ? ` (${e.role})` : ''} | "${clip(e.label, 90)}"`;
     if (e.popup) line += ' | opens a menu';
     if (e.search) line += ' | search box';
     if (e.fresh) line += ' | NEW';
@@ -109,7 +114,7 @@ export function planPrompt(snapshot, request, history = [], round = 1, { screens
     if (e.checked != null) line += ` | ${e.checked ? 'checked' : 'unchecked'}`;
     if (e.required) line += ' | required';
     return line;
-  }).join('\n');
+  });
   const last = round >= MAX_ROUNDS;
   const system = `You are Agent, a careful assistant that gets things done on the web page an office employee is looking at, in any web app (email, docs, forms, CRMs, dashboards).
 You get the page's visible text and a numbered list of things you can act on: fields, buttons, links, menus, tabs and documents/editors.
@@ -150,10 +155,18 @@ Documents and editors (kind "document": a Google Doc, an email body, a notes edi
 - To change how existing text looks (font, spacing, remove or add indents), "replace" it with exactly the same text plus the new style. Don't click toolbar formatting buttons for that: nothing is selected, so they do nothing.
 
 Respond ONLY with JSON: {"say": string, "more": boolean, "steps": [{"do": "fill"|"insert"|"submit"|"replace"|"clear"|"undo"|"select"|"check"|"uncheck"|"click", "id": string, "value": string|null, "find": string|null, "swap": boolean|null, "style": object|null}]}`;
+  // fit the page into the budget: shorter page text first, then fewer (least useful) items
+  let text = clip(snapshot.text || '', budget.text);
+  let shown = lines.length;
+  const asText = () => `${lines.slice(0, shown).join('\n')}${shown < lines.length ? `\n(${lines.length - shown} more not shown: mostly off screen. Scroll or ask the employee if you need them.)` : ''}`;
+  const size = () => text.length + lines.slice(0, shown).reduce((n, l) => n + l.length + 1, 0);
+  if (size() > budget.user) text = clip(text, Math.round(budget.text / 2));
+  while (shown > 20 && size() > budget.user) shown -= 5;
+  const list = asText();
   const user = `Page: ${snapshot.title} (${snapshot.host})
 
 Visible text:
-${snapshot.text || '(none)'}
+${text || '(none)'}
 
 Things you can act on:
 ${list || '(nothing)'}

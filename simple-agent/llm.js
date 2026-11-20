@@ -74,7 +74,8 @@ export function createLLM({
       let detail = '';
       try { detail = JSON.parse(await res.text())?.error?.message || ''; } catch { /* no readable reason */ }
       detail = String(detail).replace(/gsk_[A-Za-z0-9_-]+/g, '[key]').replace(/\s+/g, ' ').slice(0, 140); // the reason helps; a key never appears
-      throw { retryable: res.status === 429 || res.status >= 500, message: `http ${res.status}${detail ? `: ${detail}` : ''}` };
+      // "Request too large" won't fit on a second try either, so don't spend the per-minute allowance retrying it
+      throw { retryable: (res.status === 429 && !/too large/i.test(detail)) || res.status >= 500, message: `http ${res.status}${detail ? `: ${detail}` : ''}` };
     }
     let data;
     try { data = await res.json(); } catch { throw { retryable: true, message: 'bad response' }; }

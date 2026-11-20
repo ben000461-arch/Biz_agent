@@ -2581,8 +2581,19 @@ const webOps = {
     }
     if (data === undefined) {
       const { system, user } = planPrompt(c.snapshot, request, history, round);
-      try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
-        return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
+      // The small model on this computer can't operate web pages well, so when a hosted model exists, Agent never
+      // falls back to it: an honest "try again in a minute" beats a confident wrong plan.
+      const planTiers = llm.tiersFor(ent?.plan || null, 'writer');
+      const hostedOnly = planTiers.filter((t) => t !== 'local');
+      const tiers = hostedOnly.some((t) => llm.available(t)) ? hostedOnly : planTiers;
+      try {
+        const r = await als.run(ctx, () => llm.call({ tiers, role: 'writer', system, user, json: true, maxTokens: 3000 }));
+        data = r.data;
+      } catch (e) {
+        const busy = (e?.attempts || []).some((a) => /http (413|429)/.test(a.reason || ''));
+        return busy
+          ? { status: 429, body: { error: 'busy', message: 'The AI is at its limit for this minute. Wait about a minute and try again. Nothing was changed.' } }
+          : { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
       }
     }
     const plan = checkPlan(data, c.snapshot, round);
