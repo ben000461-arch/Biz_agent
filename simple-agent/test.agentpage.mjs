@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { cleanSnapshot, cleanHistory, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, cleanShot, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ''}`); } };
@@ -132,6 +132,15 @@ console.log('\n[unit]');
   const badMath = checkPlan({ steps: [{ do: 'insert', id: 'e1', find: 'the end of the month?', value: '3,278.91 + 2,166.68 = 5,000.00' }] }, docs.snapshot);
   check('a plan with wrong math is flagged and never runs on its own', badMath.mathWarnings.length === 1 && badMath.auto === false);
 
+  // screenshots: only a picture, never too big; the prompt explains the number tags; where things are
+  const goodShot = 'data:image/jpeg;base64,' + 'A'.repeat(400);
+  check('a JPEG/PNG screenshot is accepted', cleanShot(goodShot) === goodShot && cleanShot('data:image/png;base64,' + 'B'.repeat(200)) !== null);
+  check('anything else is refused', [null, 42, 'hello', 'data:text/html;base64,' + 'A'.repeat(400), 'data:image/jpeg;base64,<script>', 'data:image/jpeg;base64,' + 'A'.repeat(2_100_000), 'data:image/jpeg;base64,AAAA'].every((x) => cleanShot(x) === null));
+  const sp2 = planPrompt(c.snapshot, 'x', [], 1, { screenshot: true }).system;
+  check('with a screenshot the prompt explains the number tags and the Agent bar', /tag 12 is element e12/.test(sp2) && /"Agent" bar at the bottom/.test(sp2) && !/SCREENSHOT/.test(planPrompt(c.snapshot, 'x').system));
+  const wsnap = cleanSnapshot({ url: 'https://x.com/', title: 'X', text: '', elements: [{ id: 'e1', kind: 'field', label: 'To', where: 'dialog' }, { id: 'e2', kind: 'button', label: 'Old', offscreen: true, where: 'nowhere' }] }).snapshot;
+  check('where things are (pop-up window, off screen) reaches the model', wsnap.elements[0].where === 'dialog' && wsnap.elements[1].offscreen === true && !wsnap.elements[1].where && /"To" \| in a pop-up window/.test(planPrompt(wsnap, 'x').user) && /"Old" \| off screen/.test(planPrompt(wsnap, 'x').user));
+
   // look again (multi-step tasks)
   check('"more" passes through when there are steps', checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, 1).more === true);
   check('no "more" without steps', checkPlan({ more: true, steps: [] }, tools, 1).more === false);
@@ -241,6 +250,13 @@ try {
   r = await call('/web/agent/plan', { body: { request: 'x', page: PAGE, round: 99 } });
   check('the route caps the look number', r.status === 200 && r.body.round === MAX_ROUNDS && r.body.more === false);
   check('the route passes chat history to the model', r.status === 200 && /Earlier in this chat:[\s\S]*write about cars/.test(prompts[0] || ''));
+  // a screenshot rides along; with no model that can see, Agent plans from the list exactly as before
+  const shotB64 = 'data:image/jpeg;base64,' + 'Q'.repeat(900_000);
+  r = await call('/web/agent/plan', { body: { request: 'Fill this in', page: PAGE, screenshot: shotB64 } });
+  check('a ~900 KB screenshot is accepted; without a vision model it falls back to the list', r.status === 200 && r.body.saw === false && Array.isArray(r.body.steps) && r.body.steps.length > 0, JSON.stringify(r.body).slice(0, 200));
+  check('the screenshot never reaches the text model', !prompts.some((p) => /QQQQQQ/.test(p)));
+  r = await call('/web/agent/plan', { body: { request: 'Fill this in', page: PAGE, screenshot: 'data:image/jpeg;base64,' + 'Q'.repeat(2_300_000) } });
+  check('a screenshot over the limit is refused', r.status === 413, String(r.status));
   modelMode = 'math';
   r = await call('/web/agent/plan', { body: { request: 'x', page: PAGE } });
   check('the route warns about wrong math and makes it wait for approval', r.status === 200 && /Check this math/.test(r.body.warning || '') && /works out to 15\.00/.test(r.body.warning) && r.body.auto === false, JSON.stringify(r.body));
@@ -258,6 +274,7 @@ try {
   check('auto runs are logged as such', r.status === 200);
   await wait(2500); // logger batches
   const rows = logged.filter((x) => x.action === 'agent_page');
+  check('screenshots are never written to the log', !JSON.stringify(rows).includes('QQQQ'));
   check('the log marks tasks that ran on their own', rows.some((x) => /1\/1 step done \(ran on its own\)/.test(x.detail)), JSON.stringify(rows.map((x) => x.detail)));
   check('the action log has the plan and the result', rows.some((x) => x.status === 'proposed' && /intake\.example\.com · 2 steps/.test(x.detail)) && rows.some((x) => x.status === 'done' && /2\/2 steps done/.test(x.detail)), JSON.stringify(rows));
   check('nothing from the page is logged (no names, text, values or full URL)', !JSON.stringify(rows).match(/Maria|Lopez|accident|maria@|\/new\?x=1|intake from the email/));

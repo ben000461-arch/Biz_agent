@@ -38,7 +38,7 @@ import { createLogger } from './logger.js';
 import { createAlerts, redact } from './alerts.js';
 import { createAccounts } from './account.js';
 import { createNotes } from './notes.js';
-import { cleanSnapshot, cleanHistory, planPrompt, checkPlan, MAX_ROUNDS } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, cleanShot, planPrompt, checkPlan, MAX_ROUNDS } from './agentpage.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -119,7 +119,7 @@ const llm = createLLM({
   groqKey: process.env.GROQ_API_KEY || '',
   groqBase: GROQ_API_BASE || undefined,
   ollamaHost: OLLAMA_HOST,
-  models: { small: process.env.LLM_SMALL_MODEL, large: process.env.LLM_LARGE_MODEL, local: OLLAMA_MODEL },
+  models: { small: process.env.LLM_SMALL_MODEL, large: process.env.LLM_LARGE_MODEL, local: OLLAMA_MODEL, vision: process.env.AGENT_VISION_MODEL },
   log: (r) => {
     const c = als.getStore();
     if (c && !r.failed) (c.receipts ||= []).push(r); // the credit meter (next step) reads these
@@ -145,7 +145,7 @@ async function settle(ctx, tenant, action, kind) {
     return null;
   }
 }
-console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
+console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}, vision ${llm.available('vision') ? llm.names.vision : 'off'}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
 // Commands a paused (frozen) customer may still use: seeing help, and disconnecting their own accounts.
 const FROZEN_OK_COMMANDS = new Set(['/start', '/help', '/connections', '/deleteaccount', '/deleteaccount_confirm', '/disconnect', '/disconnect_google', '/disconnect_github', '/disconnect_model', '/unlink']);
 function logEvent(tenant, row) {
@@ -2567,16 +2567,29 @@ const webOps = {
     if (!rl.ok) return { status: 429, body: { error: 'slow', message: 'Slow down a little and try again in a minute.' } };
     const ctx = { tenant, ent };
     const round = Math.max(1, Math.min(MAX_ROUNDS, Number.parseInt(b.round, 10) || 1));
-    const { system, user } = planPrompt(c.snapshot, request, cleanHistory(b.history), round);
-    let data;
-    try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
-      return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
+    const history = cleanHistory(b.history);
+    // With a screenshot and a model that can see, plan from the picture + the list; otherwise (or if that model
+    // fails) plan from the list alone, exactly as before. The picture is used for this one call and never kept.
+    const shot = cleanShot(b.screenshot);
+    let data, saw = false;
+    if (shot && llm.available('vision') && process.env.AGENT_SCREENSHOTS !== 'off') {
+      const p = planPrompt(c.snapshot, request, history, round, { screenshot: true });
+      try {
+        const r = await als.run(ctx, () => llm.call({ tiers: ['vision'], role: 'writer', system: p.system, user: p.user, image: shot, json: true, maxTokens: 3000, timeoutMs: 45_000 }));
+        data = r.data; saw = true;
+      } catch { data = undefined; }
+    }
+    if (data === undefined) {
+      const { system, user } = planPrompt(c.snapshot, request, history, round);
+      try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
+        return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
+      }
     }
     const plan = checkPlan(data, c.snapshot, round);
     logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
     const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
     const warning = [...plan.mathWarnings, ...(warn ? [warn] : [])].join(' ') || undefined;
-    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, ...(warning ? { warning } : {}) } };
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, saw, ...(warning ? { warning } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
   async agentLog(tenant, b) {

@@ -67,6 +67,8 @@ export function cleanSnapshot(raw) {
     if (e.kind === 'document') { const st = cleanStyle(e.style); if (st) el.style = st; } // how its text looks now
     if (e.popup === true) el.popup = true;
     if (e.kind === 'field' && e.search === true) el.search = true; // a search box: pressing Enter just searches
+    if (['dialog', 'top', 'side', 'main', 'bottom'].includes(e.where)) el.where = e.where; // where it is on screen
+    if (e.offscreen === true) el.offscreen = true; // scrolled out of view
     if (e.fresh === true) el.fresh = true; // appeared after Agent's last step (a dialog, a compose window...)      // opens a menu, list or tab (harmless to click)
     if (ROLES.has(e.role)) el.role = e.role;
     if (e.kind === 'select' && Array.isArray(e.options)) el.options = e.options.slice(0, 60).map((o) => clip(o, 80));
@@ -93,12 +95,14 @@ export function cleanHistory(raw) {
     .map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
 }
 
-export function planPrompt(snapshot, request, history = [], round = 1) {
+export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false } = {}) {
   const list = snapshot.elements.map((e) => {
     let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''}${e.role ? ` (${e.role})` : ''} | "${e.label}"`;
     if (e.popup) line += ' | opens a menu';
     if (e.search) line += ' | search box';
     if (e.fresh) line += ' | NEW';
+    if (e.where === 'dialog') line += ' | in a pop-up window';
+    if (e.offscreen) line += ' | off screen';
     if (e.kind === 'document') line += (e.empty ? ' | empty' : e.value ? ` | contains: "${e.value}"` : '') + (e.style ? ` | current style: ${JSON.stringify(e.style)}` : '');
     else if (e.value) line += ` | now: "${e.value}"`;
     if (e.options) line += ` | options: ${e.options.map((o) => `"${o}"`).join(', ')}`;
@@ -110,7 +114,9 @@ export function planPrompt(snapshot, request, history = [], round = 1) {
   const system = `You are Agent, a careful assistant that gets things done on the web page an office employee is looking at, in any web app (email, docs, forms, CRMs, dashboards).
 You get the page's visible text and a numbered list of things you can act on: fields, buttons, links, menus, tabs and documents/editors.
 
-How to think:
+${screenshot ? `You also get a SCREENSHOT of what the employee sees. Each thing you can act on has a small numbered tag drawn on it: tag 12 is element e12. Use the picture to tell things apart (which box is the big title, which window just opened, what's selected). Black boxes hide private fields. The "Agent" bar at the bottom of the screen is you: ignore it and anything underneath it.
+
+` : ''}How to think:
 - First work out what the employee actually wants and what's on the page now (read the text and what each document contains).
 - Prefer the smallest change that does it. Add when they ask to add; rewrite only when they ask to change what's there.
 - If a tool on the page can do it (a menu, a toolbar button, a dialog), use it. Menus often have to be opened first.
@@ -260,4 +266,14 @@ export function checkMath(text) {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------- screenshot
+// The page as the employee sees it, drawn with numbered tags by the extension. Only a JPEG or PNG data URL,
+// at most ~1.5 MB. It goes to the vision model for one plan and is never stored or logged.
+export const MAX_SHOT_CHARS = 2_000_000;
+export function cleanShot(x) {
+  if (typeof x !== 'string' || x.length > MAX_SHOT_CHARS) return null;
+  const m = x.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/);
+  return m && m[2].length > 100 ? x : null;
 }

@@ -6,6 +6,7 @@
 //
 //   small = hosted Groq model (default openai/gpt-oss-20b)      large = hosted Groq model (openai/gpt-oss-120b)
 //   local = Ollama on your own computer (llama3.2:3b), last fallback only
+//   vision = a hosted model that can also look at a picture (the Agent's screenshots); only used when asked for
 //
 // Rules: a call never hangs (timeouts), a flaky model gets ONE retry, a broken one hands over to the next tier in
 // the plan's fallback list, and the receipt says so (degraded: true) so credits are charged for the tier that
@@ -35,13 +36,16 @@ export function createLLM({
     small: models.small || 'openai/gpt-oss-20b',
     large: models.large || 'openai/gpt-oss-120b',
     local: models.local || 'llama3.2:3b',
+    vision: models.vision || 'qwen/qwen3.8-27b',
   };
-  const hosted = (tier) => tier === 'small' || tier === 'large';
-  const available = (tier) => (hosted(tier) ? Boolean(groqKey) : tier === 'local');
+  const hosted = (tier) => tier === 'small' || tier === 'large' || tier === 'vision';
+  const available = (tier) => (hosted(tier) ? Boolean(groqKey) && Boolean(names[tier]) : tier === 'local');
 
   // One attempt against one model. Returns { text, usage } or throws { retryable, message }.
-  async function once(tier, { system, user, history, json, temperature, maxTokens, timeoutMs }) {
-    const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: user }];
+  async function once(tier, { system, user, history, json, temperature, maxTokens, timeoutMs, image }) {
+    // a picture goes along only to the vision model; it is never logged or kept
+    const userContent = image && tier === 'vision' ? [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: image } }] : user;
+    const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }];
     let res;
     try {
       if (hosted(tier)) {
@@ -100,7 +104,11 @@ export function createLLM({
           const { text, usage } = await once(tier, { ...o, timeoutMs });
           let data = text;
           if (o.json) {
-            try { data = JSON.parse(text); } catch { throw { retryable: true, message: 'invalid json' }; }
+            try { data = JSON.parse(text); } catch {
+              // some models wrap the JSON in thinking or prose: take the outermost {...} if it parses
+              const a = text.indexOf('{'), b = text.lastIndexOf('}');
+              try { if (a === -1 || b <= a) throw 0; data = JSON.parse(text.slice(a, b + 1)); } catch { throw { retryable: true, message: 'invalid json' }; }
+            }
           }
           const receipt = { role: o.role || null, tier, model: names[tier], degraded: i > 0, firstChoice: tiers[0], ms: Date.now() - t0, usage, attempts: attempts.length + 1, failures: attempts.map((a) => `${a.tier}:${a.reason}`) };
           log(receipt);

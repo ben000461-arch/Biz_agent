@@ -136,5 +136,29 @@ const mk = (script, extra = {}) => { const f = fake(script); return { f, llm: cr
   ok(r.tier === 'small' && r.text === 'small ok', 'empty answers handled');
 }
 
+// 16. vision: the picture goes only to the vision model, as an image part; never to text models; falls back to text
+{
+  const { f, llm } = mk([{ text: '{"say":"ok","steps":[]}' }]);
+  const img = 'data:image/jpeg;base64,AAAA';
+  const r = await llm.call({ tiers: ['vision', 'large'], system: 's', user: 'plan this', image: img, json: true });
+  const c = f.calls[0].body;
+  ok(r.tier === 'vision' && c.model === 'qwen/qwen3.8-27b' && Array.isArray(c.messages[1].content) && c.messages[1].content[1].image_url.url === img && c.messages[1].content[0].text === 'plan this', 'vision gets text + image');
+  ok(!('reasoning_effort' in c), 'no gpt-oss setting on the vision model');
+}
+{
+  const { f, llm } = mk([{ status: 400 }, { text: '{"say":"text only"}' }], { models: { vision: 'some/vision-model' } });
+  const r = await llm.call({ tiers: ['vision', 'large'], system: 's', user: 'u', image: 'data:image/jpeg;base64,AAAA', json: true });
+  ok(r.tier === 'large' && typeof f.calls[1].body.messages[1].content === 'string' && f.calls[0].body.model === 'some/vision-model', 'vision fails -> text model, no image sent to it');
+}
+{
+  const { llm } = mk([{ text: 'Sure! <think>x</think> {"say":"wrapped","steps":[]} hope that helps' }]);
+  const r = await llm.call({ tiers: ['small'], system: 's', user: 'u', json: true });
+  ok(r.data.say === 'wrapped', 'JSON inside extra words is still read');
+}
+{
+  const llm = createLLM({ groqKey: '', fetchImpl: fake([]), retryDelayMs: 1 });
+  ok(llm.available('vision') === false, 'no key, no vision');
+}
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

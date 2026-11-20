@@ -86,8 +86,9 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
     next();
   };
   const bigJson = express.json({ limit: '256kb' }); // a page snapshot is bigger than a normal request
+  const planJson = express.json({ limit: '2mb' }); // ...and a plan may also carry one screenshot
   router.options(['/agent/plan', '/agent/log'], corsAgent, (_req, res) => res.status(204).end());
-  router.post('/agent/plan', corsAgent, limitIp, bigJson, who, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
+  router.post('/agent/plan', corsAgent, limitIp, planJson, who, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
   router.post('/agent/log', corsAgent, limitIp, json, who, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
   router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
   router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));
