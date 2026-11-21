@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { cleanSnapshot, cleanHistory, cleanShot, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
+import { appTips, cleanFailure, cleanSnapshot, cleanHistory, cleanShot, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ''}`); } };
@@ -141,6 +141,14 @@ console.log('\n[unit]');
   const wsnap = cleanSnapshot({ url: 'https://x.com/', title: 'X', text: '', elements: [{ id: 'e1', kind: 'field', label: 'To', where: 'dialog' }, { id: 'e2', kind: 'button', label: 'Old', offscreen: true, where: 'nowhere' }] }).snapshot;
   check('where things are (pop-up window, off screen) reaches the model', wsnap.elements[0].where === 'dialog' && wsnap.elements[1].offscreen === true && !wsnap.elements[1].where && /"To" \| in a pop-up window/.test(planPrompt(wsnap, 'x').user) && /"Old" \| off screen/.test(planPrompt(wsnap, 'x').user));
 
+  // retry with the reason, and app know-how
+  const fp = planPrompt(c.snapshot, 'x', [], 2, { failure: cleanFailure('Fill "Email": the field didn’t accept that value. SSN 123-45-6789') }).user;
+  check('a failed try is told to the model, masked, with "try another way"', /YOUR LAST TRY DIDN'T WORK: Fill "Email"/.test(fp) && /Try another way/.test(fp) && !/123-45-6789/.test(fp));
+  check('no failure, no failure line', !/LAST TRY/.test(planPrompt(c.snapshot, 'x').user));
+  check('Gmail and Slides get their own tips; other sites none', /click "Compose" first/.test(appTips('mail.google.com')) && /title box/.test(appTips('docs.google.com', 'https://docs.google.com/presentation/d/x/edit')) && appTips('example.com') === '');
+  const gm = cleanSnapshot({ url: 'https://mail.google.com/mail/u/0/', title: 'Inbox', text: '', elements: [{ id: 'e1', kind: 'button', label: 'Compose' }] }).snapshot;
+  check('tips are in the prompt on that site', /Tips for this app: Gmail/.test(planPrompt(gm, 'x', [], 1, { url: 'https://mail.google.com/mail/u/0/' }).user));
+
   // look again (multi-step tasks)
   check('"more" passes through when there are steps', checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, 1).more === true);
   check('no "more" without steps', checkPlan({ more: true, steps: [] }, tools, 1).more === false);
@@ -171,7 +179,7 @@ console.log('\n[unit]');
 }
 
 // ---------------------------------------------------------------- the real server
-const P = { tg: 18951, ollama: 18952, app: 18953, sb: 18955 };
+const P = { tg: 18951, ollama: 18952, app: 18953, sb: 18955, groq: 18956, app2: 18957 };
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agentpage-'));
 const readBody = (req) => new Promise((r) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => r(Buffer.concat(c).toString())); });
 const json = (res, code, body) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(body)); };
@@ -279,6 +287,44 @@ try {
   check('the action log has the plan and the result', rows.some((x) => x.status === 'proposed' && /intake\.example\.com · 2 steps/.test(x.detail)) && rows.some((x) => x.status === 'done' && /2\/2 steps done/.test(x.detail)), JSON.stringify(rows));
   check('nothing from the page is logged (no names, text, values or full URL)', !JSON.stringify(rows).match(/Maria|Lopez|accident|maria@|\/new\?x=1|intake from the email/));
   check('server log has no page content either', !/Maria Lopez|123-45-6789|Car accident/.test(log));
+
+  // ---- with a hosted model (fake Groq): screenshot -> vision; too big -> text; all too big -> honest "busy"
+  console.log('\n[hosted models]');
+  let groqMode = 'ok'; const groqSeen = [];
+  const groq = http.createServer(async (req, res) => {
+    const body = JSON.parse(await readBody(req));
+    const content = body.messages[body.messages.length - 1].content;
+    const hasImage = Array.isArray(content) && content.some((p) => p.type === 'image_url');
+    groqSeen.push({ model: body.model, hasImage });
+    if (groqMode === 'toolarge' || (hasImage && groqMode === 'visiontoolarge')) return json(res, 413, { error: { message: 'Request too large for model on tokens per minute' } });
+    json(res, 200, { choices: [{ message: { content: JSON.stringify({ say: 'Opening Compose.', steps: [{ do: 'click', id: 'e5' }] }) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
+  });
+  await new Promise((r) => groq.listen(P.groq, r));
+  const proc2 = spawn('node', ['server.js'], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: { ...process.env, GROQ_API_KEY: 'gsk_test', GROQ_API_BASE: `http://127.0.0.1:${P.groq}`, HOME: tmp, TELEGRAM_BOT_TOKEN: 'T', ADMIN_TELEGRAM_ID: '111', TELEGRAM_WEBHOOK_SECRET: 's',
+      TELEGRAM_API_BASE: `http://127.0.0.1:${P.tg}`, OLLAMA_HOST: `http://127.0.0.1:${P.ollama}`, PORT: String(P.app2),
+      TENANTS_FILE: tenantsFile, WORKSPACES_DIR: path.join(tmp, 'ws2'), CONNECTIONS_FILE: path.join(tmp, 'conn2.json'),
+      SITE_URL: 'https://site.test/coop/', SUPABASE_URL: `http://127.0.0.1:${P.sb}`, SUPABASE_SERVICE_KEY: 'sb_secret_test',
+      AGENT_TICK_MS: '600000', EVENT_POLL_MS: '600000', SIGNUP_POLL_MS: '600000' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    for (let i = 0; i < 80; i++) { try { if ((await fetch(`http://127.0.0.1:${P.app2}/health`)).ok) break; } catch {} await wait(100); }
+    const call2 = async (body) => { const res = await fetch(`http://127.0.0.1:${P.app2}/web/agent/plan`, { method: 'POST', headers: { origin: EXT, 'content-type': 'application/json', authorization: `Bearer ${TOK_A}` }, body: JSON.stringify(body) }); let b = null; try { b = await res.json(); } catch {} return { status: res.status, body: b }; };
+    const img = 'data:image/jpeg;base64,' + 'Q'.repeat(5000);
+    prompts.length = 0; groqSeen.length = 0;
+    r = await call2({ request: 'write a draft', page: PAGE, screenshot: img });
+    check('with a screenshot, the vision model gets the picture and Agent says it looked', r.status === 200 && r.body.saw === true && groqSeen[0]?.hasImage && groqSeen[0]?.model === 'qwen/qwen3.8-27b', JSON.stringify({ r, groqSeen }));
+    groqMode = 'visiontoolarge'; groqSeen.length = 0;
+    r = await call2({ request: 'write a draft', page: PAGE, screenshot: img });
+    check('picture too big for the vision model -> plans from the list with a hosted model (no picture)', r.status === 200 && r.body.saw === false && r.body.steps.length === 1 && groqSeen.length === 2 && !groqSeen[1].hasImage, JSON.stringify(groqSeen));
+    check('"too large" is not retried (it would only burn the per-minute allowance)', groqSeen.filter((g) => g.hasImage).length === 1);
+    groqMode = 'toolarge'; groqSeen.length = 0; prompts.length = 0;
+    r = await call2({ request: 'write a draft', page: PAGE, screenshot: img });
+    check('every hosted model at its limit -> an honest "wait a minute", not a guess', r.status === 429 && r.body.error === 'busy' && /Wait about a minute/.test(r.body.message), JSON.stringify(r));
+    check('...and it never falls back to the tiny local model for page work', prompts.length === 0);
+  } finally { proc2.kill('SIGTERM'); groq.close(); await wait(300); }
 } finally {
   proc.kill('SIGTERM'); await wait(300);
   for (const s of [tg, ollama, sb]) s.close();

@@ -38,7 +38,7 @@ import { createLogger } from './logger.js';
 import { createAlerts, redact } from './alerts.js';
 import { createAccounts } from './account.js';
 import { createNotes } from './notes.js';
-import { cleanSnapshot, cleanHistory, cleanShot, planPrompt, checkPlan, MAX_ROUNDS } from './agentpage.js';
+import { cleanSnapshot, cleanHistory, cleanShot, cleanFailure, planPrompt, checkPlan, MAX_ROUNDS } from './agentpage.js';
 import { createLinker } from './linker.js';
 import { createSignups, shortId } from './signups.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -120,6 +120,8 @@ const llm = createLLM({
   groqBase: GROQ_API_BASE || undefined,
   ollamaHost: OLLAMA_HOST,
   models: { small: process.env.LLM_SMALL_MODEL, large: process.env.LLM_LARGE_MODEL, local: OLLAMA_MODEL, vision: process.env.AGENT_VISION_MODEL },
+  // optional stronger model for Agent's page plans, from any OpenAI-style provider (OpenAI, OpenRouter, a company's own)
+  agent: process.env.AGENT_MODEL ? { base: process.env.AGENT_MODEL_BASE, key: process.env.AGENT_MODEL_KEY, model: process.env.AGENT_MODEL } : null,
   log: (r) => {
     const c = als.getStore();
     if (c && !r.failed) (c.receipts ||= []).push(r); // the credit meter (next step) reads these
@@ -145,7 +147,7 @@ async function settle(ctx, tenant, action, kind) {
     return null;
   }
 }
-console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}, vision ${llm.available('vision') ? llm.names.vision : 'off'}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
+console.log(`Models: hosted ${process.env.GROQ_API_KEY ? 'on' : 'OFF (no GROQ_API_KEY: everything runs on the local model)'} [small ${llm.names.small}, large ${llm.names.large}, vision ${llm.available('vision') ? llm.names.vision : 'off'}, agent ${llm.available('agent') ? llm.names.agent : 'off'}], local ${llm.names.local}. Plans: ${entitlements.enabled ? 'on' : 'OFF (no Supabase settings: every business runs in limited mode)'}.`);
 // Commands a paused (frozen) customer may still use: seeing help, and disconnecting their own accounts.
 const FROZEN_OK_COMMANDS = new Set(['/start', '/help', '/connections', '/deleteaccount', '/deleteaccount_confirm', '/disconnect', '/disconnect_google', '/disconnect_github', '/disconnect_model', '/unlink']);
 function logEvent(tenant, row) {
@@ -2568,21 +2570,34 @@ const webOps = {
     const ctx = { tenant, ent };
     const round = Math.max(1, Math.min(MAX_ROUNDS, Number.parseInt(b.round, 10) || 1));
     const history = cleanHistory(b.history);
+    const extra = { failure: cleanFailure(b.failure), url: typeof b.page?.url === 'string' ? b.page.url : '' };
     // With a screenshot and a model that can see, plan from the picture + the list; otherwise (or if that model
     // fails) plan from the list alone, exactly as before. The picture is used for this one call and never kept.
     const shot = cleanShot(b.screenshot);
     let data, saw = false;
-    if (shot && llm.available('vision') && process.env.AGENT_SCREENSHOTS !== 'off') {
-      const p = planPrompt(c.snapshot, request, history, round, { screenshot: true });
+    const seeTiers = [...(llm.available('agent') && process.env.AGENT_MODEL_SEES === '1' ? ['agent'] : []), ...(llm.available('vision') ? ['vision'] : [])];
+    if (shot && seeTiers.length && process.env.AGENT_SCREENSHOTS !== 'off') {
+      const p = planPrompt(c.snapshot, request, history, round, { screenshot: true, ...extra });
       try {
-        const r = await als.run(ctx, () => llm.call({ tiers: ['vision'], role: 'writer', system: p.system, user: p.user, image: shot, json: true, maxTokens: 3000, timeoutMs: 45_000 }));
+        const r = await als.run(ctx, () => llm.call({ tiers: seeTiers, role: 'writer', system: p.system, user: p.user, image: shot, json: true, maxTokens: 3000, timeoutMs: 45_000 }));
         data = r.data; saw = true;
       } catch { data = undefined; }
     }
     if (data === undefined) {
-      const { system, user } = planPrompt(c.snapshot, request, history, round);
-      try { data = await als.run(ctx, () => callLocalModel(system, user, { role: 'writer' })); } catch {
-        return { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
+      const { system, user } = planPrompt(c.snapshot, request, history, round, extra);
+      // The small model on this computer can't operate web pages well, so when a hosted model exists, Agent never
+      // falls back to it: an honest "try again in a minute" beats a confident wrong plan.
+      const planTiers = llm.tiersFor(ent?.plan || null, 'writer');
+      const hostedOnly = planTiers.filter((t) => t !== 'local');
+      const tiers = [...(llm.available('agent') ? ['agent'] : []), ...(hostedOnly.some((t) => llm.available(t)) ? hostedOnly : planTiers)];
+      try {
+        const r = await als.run(ctx, () => llm.call({ tiers, role: 'writer', system, user, json: true, maxTokens: 3000 }));
+        data = r.data;
+      } catch (e) {
+        const busy = (e?.attempts || []).some((a) => /http (413|429)/.test(a.reason || ''));
+        return busy
+          ? { status: 429, body: { error: 'busy', message: 'The AI is at its limit for this minute. Wait about a minute and try again. Nothing was changed.' } }
+          : { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
       }
     }
     const plan = checkPlan(data, c.snapshot, round);

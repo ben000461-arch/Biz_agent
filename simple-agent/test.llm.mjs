@@ -14,7 +14,7 @@ function fake(script) {
     const step = script.shift();
     if (!step) throw new Error('script ran out');
     if (step.throw) { const e = new Error('x'); e.name = step.throw; throw e; }
-    const groq = url.includes('groq');
+    const groq = url.includes('/chat/completions'); // OpenAI-style (Groq or any other provider)
     const payload = groq ? { choices: [{ message: { content: step.text ?? '' } }], usage: { prompt_tokens: 10, completion_tokens: 5 } }
       : { message: { content: step.text ?? '' }, prompt_eval_count: 7, eval_count: 3 };
     return { ok: (step.status || 200) < 400, status: step.status || 200, json: async () => (step.badJson ? Promise.reject(new Error('bad')) : payload) };
@@ -158,6 +158,14 @@ const mk = (script, extra = {}) => { const f = fake(script); return { f, llm: cr
 {
   const llm = createLLM({ groqKey: '', fetchImpl: fake([]), retryDelayMs: 1 });
   ok(llm.available('vision') === false, 'no key, no vision');
+}
+
+// 17. optional stronger model for Agent plans: its own address and key, never Groq's key
+{
+  const { f, llm } = mk([{ text: '{"say":"ok"}' }], { agent: { base: 'https://api.openrouter.example/v1/', key: 'sk-or-abc', model: 'big/agent-model' } });
+  const r = await llm.call({ tiers: ['agent', 'large'], system: 's', user: 'u', json: true, image: 'data:image/jpeg;base64,AAAA' });
+  ok(r.tier === 'agent' && f.calls[0].url === 'https://api.openrouter.example/v1/chat/completions' && f.calls[0].headers.authorization === 'Bearer sk-or-abc' && f.calls[0].body.model === 'big/agent-model' && Array.isArray(f.calls[0].body.messages[1].content), 'agent model: own address, own key, sees the picture');
+  ok(createLLM({ groqKey: 'gsk_x', fetchImpl: fake([]) }).available('agent') === false, 'no agent model unless all three are set');
 }
 
 console.log(`${pass} passed, ${fail} failed`);
