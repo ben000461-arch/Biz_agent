@@ -173,6 +173,11 @@ console.log('\n[unit]');
   const gp = planPrompt(slidesSnap, 'you didnt add the history', kept, 1).user;
   check('the whole task is pinned in the prompt, in their words', /THE TASK SO FAR[\s\S]*1\. make a 3 slide deck[\s\S]*2\. you didnt add the history/.test(gp));
   check('the prompt says to write the content itself, not ask for it', /Don't ask the employee for content you can write yourself/.test(planPrompt(slidesSnap, 'x').system));
+  const showSnap = cleanSnapshot({ url: 'https://docs.google.com/presentation/d/x/edit', title: 'Deck', text: '', elements: [
+    { id: 'e1', kind: 'button', label: 'Slide 2 (showing now)', role: 'tab' }, { id: 'e2', kind: 'document', label: 'Text box "Click to add title"', empty: true }] }).snapshot;
+  const showing = checkPlan({ steps: [{ do: 'click', id: 'e1' }, { do: 'fill', id: 'e2', value: 'A Short History of BMW' }] }, showSnap, 1);
+  check('clicking the slide that is already showing is skipped, and the writing goes ahead in the same go', showing.steps.length === 1 && showing.steps[0].do === 'fill' && showing.dropped.length === 1, JSON.stringify(showing));
+  check('the prompt says how to delete a slide', /Delete slide/.test(planPrompt(slidesSnap, 'x', [], 1, { url: 'https://docs.google.com/presentation/d/x/edit' }).system + planPrompt(slidesSnap, 'x', [], 1, { url: 'https://docs.google.com/presentation/d/x/edit' }).user));
   check('the prompt says a click ends the steps', /always get a fresh look after any click/.test(planPrompt(slidesSnap, 'x').system));
 
   // look again (multi-step tasks)
