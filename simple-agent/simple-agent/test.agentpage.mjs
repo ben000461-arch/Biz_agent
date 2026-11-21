@@ -157,6 +157,10 @@ console.log('\n[unit]');
   const lastClick = checkPlan({ steps: [{ do: 'fill', id: 'e1', value: 'x' }, { do: 'click', id: 'e3' }] }, slidesSnap, 1);
   check('a click at the end is fine (no forced look again)', lastClick.steps.length === 2 && lastClick.more === false);
   check('…but never past the last look', checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'fill', id: 'e1', value: 'x' }] }, slidesSnap, MAX_ROUNDS).more === false);
+  const popSnap = cleanSnapshot({ url: 'https://docs.google.com/presentation/d/x/edit', title: 'Deck', text: '', elements: [
+    { id: 'e1', kind: 'document', label: 'Text box "Click to add title"', empty: true }, { id: 'e2', kind: 'button', label: 'New slide (Ctrl+M)', popup: true }] }).snapshot;
+  const pop = checkPlan({ steps: [{ do: 'click', id: 'e2' }, { do: 'fill', id: 'e1', value: 'Dogs' }] }, popSnap, 1);
+  check('a button with a menu arrow (New slide) followed by typing still looks again first', pop.steps.length === 1 && pop.more === true, JSON.stringify(pop));
   check('the prompt says a click ends the steps', /always get a fresh look after any click/.test(planPrompt(slidesSnap, 'x').system));
 
   // look again (multi-step tasks)

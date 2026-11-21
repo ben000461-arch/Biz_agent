@@ -248,7 +248,9 @@ export function checkPlan(data, snapshot, round = 1) {
   // and look again: the next round plans from what's really there.
   // Opening a menu is the exception: nothing on the page changes until something IN the menu is picked, so
   // "Insert → Image" can still run as one plan.
-  const clickAt = steps.findIndex((st) => st.do === 'click' && !byId.get(st.id)?.popup);
+  // (Only when the NEXT step is a click too, i.e. picking from the menu. "New slide" has a little menu arrow, but
+  // typing right after it would aim at the old slide.)
+  const clickAt = steps.findIndex((st, i) => st.do === 'click' && !(byId.get(st.id)?.popup && steps[i + 1]?.do === 'click'));
   let cutAfterClick = false;
   if (clickAt !== -1 && clickAt < steps.length - 1) {
     for (const st of steps.splice(clickAt + 1)) dropped.push(`"${st.label}" waits until I look again after the click`);
