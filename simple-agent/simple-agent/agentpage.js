@@ -18,7 +18,9 @@ const MAX_TEXT = 6000;
 const MAX_VALUE = 2000;
 const MAX_DOC_VALUE = 12000; // a whole essay can go into a document
 export const AUTO_MAX_STEPS = 6;
-export const MAX_ROUNDS = 6; // look-act-look again, for things like opening a menu and then picking from it
+export const MAX_ROUNDS = 10;
+// "Slide 1 Title", "Subtitle here", "Speaker notes here", "Body text", "Lorem ipsum"...: not real content
+const PLACEHOLDER_TEXT = /^(?:(?:slide|page)\s*\d+\s*)?(?:title|subtitle|heading|body|text|content|speaker notes|notes|bullet(?: point)?s?|point)(?:\s*\d+)?(?:\s+(?:here|goes here|text))?\.?$|lorem ipsum|^click to add\b/i; // look-act-look again, for things like opening a menu and then picking from it
 const ROLES = new Set(['menuitem', 'menu', 'tab', 'option', 'switch', 'treeitem', 'combobox']);
 const MAX_HISTORY = 6;
 // "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
@@ -104,7 +106,7 @@ export const PROMPT_BUDGET = { text: 2500, user: 9000 }; // characters (about 4 
 export function appTips(host, url = '') {
   const h = String(host || '').toLowerCase(), u = String(url || '');
   if (h === 'mail.google.com') return 'Gmail: to write an email, click "Compose" first, then fill "To recipients", then "Subject", then the "Message Body" (a document). Never click "Send" unless the employee clearly asked to send. A draft saves on its own.';
-  if (h === 'docs.google.com' && /\/presentation\//.test(u)) return 'Google Slides: each slide\'s boxes are listed as Text box "...". Write the title in the title box and the rest in the body box. To add a slide, click "New slide" and look again before writing on it.';
+  if (h === 'docs.google.com' && /\/presentation\//.test(u)) return 'Google Slides: each slide\'s boxes are listed as Text box "...". Write the title in the title box and the rest in the body box. To add a slide, click "New slide" and look again before writing on it. A content slide should have a title box and a body box ("Click to add text"); if a new slide only has a title and subtitle, click "Layout" and pick "Title and body" first. "Speaker notes" are NOT on the slide: only write there if asked.';
   if (h === 'docs.google.com' && /\/spreadsheets\//.test(u)) return 'Google Sheets: click the "Name Box", type a cell like B2, press Enter (submit), then type the value into the cell editor.';
   if (h === 'docs.google.com' && /\/document\//.test(u)) return 'Google Docs: the page is one document. Add with "fill", rewrite with "replace", answer at a spot with "insert".';
   if (/(^|\.)outlook\.(office|live)\.com$/.test(h)) return 'Outlook: click "New mail", fill "To", "Add a subject", then the message body. Never click "Send" unless asked.';
@@ -160,6 +162,8 @@ Documents and editors (kind "document": a Google Doc, an email body, a notes edi
 - "insert" writes your text AT A SPOT in the document: "find" is text that's in the document now, copied exactly and unique (a question's last words, or a blank like "a. ________"). Your text goes right after it; with "swap": true it replaces it (use that to fill in blanks). Use this to answer questions where they are, one step per answer. Keep inserted text short (one line).
 - "clear" deletes everything. "undo" takes back your last change ("value": "all" to undo every change you made, back to the original).
 - Slides and other editors can have several text boxes, each listed as its own document (for example 'Text box "Click to add title"'). Write into the right one; a box showing "Click to add..." is empty.
+- Write the REAL content they asked for, about their topic (a deck about dogs and cats gets real titles and real points about dogs and cats). Never type placeholder text like "Slide 1 Title", "Subtitle here" or "Speaker notes here".
+- When the whole task is finished, return no steps, "more": false, and say what you did.
 - Text format: a line "# Title" is the title, "## Heading" a heading, a blank line between paragraphs. Never run paragraphs together.
 - Style (optional, on fill/replace): "style": {"font": "Times New Roman", "size": 12, "spacing": "single"|"1.5"|"double", "indent": true|false (first-line indent), "align": "left"|"center"|"right"|"justify"}.
 - New text automatically matches the document's current style. Only give a style when they ask for a different look, and then keep it the same for every paragraph.
@@ -215,6 +219,7 @@ export function checkPlan(data, snapshot, round = 1) {
     const step = { do: action, id: el.id, label: el.label || el.kind, kind: el.kind };
     if (action === 'fill' || action === 'replace') {
       if (s.value == null || String(s.value).trim() === '') { dropped.push(`no value for "${el.label}"`); continue; }
+      if (PLACEHOLDER_TEXT.test(String(s.value).trim())) { dropped.push(`"${clip(s.value, 40)}" is placeholder text, not real content`); continue; }
       step.value = clip(s.value, el.kind === 'document' ? MAX_DOC_VALUE : MAX_VALUE);
       if (el.kind === 'document') {
         const st = cleanStyle(s.style ?? (s.spacing === 'double' ? { spacing: 'double' } : null));
@@ -261,12 +266,13 @@ export function checkPlan(data, snapshot, round = 1) {
     if (st.do === 'fill') return el.kind === 'document' || !el.value;
     if (st.do === 'insert') return !st.swap || /_{3,}/.test(st.find); // adding next to text, or filling a blank line
     if (st.do === 'replace') return el.empty === true;
-    if (st.do === 'click') return el.popup === true || el.role === 'tab';
+    if (st.do === 'click') return el.popup === true || el.role === 'tab' || /^(?:new|add) (?:slide|page|tab|sheet|row)\b/i.test(el.label) || /^layout\b|^title and body$/i.test(el.label);
     if (st.do === 'undo') return st.value === 'last';
     if (st.do === 'submit') return el.search === true; // Enter in a search box only searches; in a form it may send
     return st.do === 'select' || st.do === 'check' || st.do === 'uncheck';
   });
-  const more = (data?.more === true || cutAfterClick) && steps.length > 0 && round < MAX_ROUNDS;
+  const endsWithClick = steps.length > 0 && steps[steps.length - 1].do === 'click' && !byId.get(steps[steps.length - 1].id)?.search;
+  const more = (data?.more === true || cutAfterClick || endsWithClick) && steps.length > 0 && round < MAX_ROUNDS;
   // math that doesn't add up is flagged and never runs on its own
   const mathWarnings = steps.flatMap((st) => checkMath(st.value).map((m) => `Check this math in "${st.label}": ${m}`)).slice(0, 5);
   const say = clip(data?.say, 400).trim() || (steps.length ? `I'll do ${steps.length} step${steps.length === 1 ? '' : 's'} on this page.` : "I couldn't find a way to do that on this page.");
