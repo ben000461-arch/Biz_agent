@@ -22,7 +22,7 @@ export const MAX_ROUNDS = 10;
 // "Slide 1 Title", "Subtitle here", "Speaker notes here", "Body text", "Lorem ipsum"...: not real content
 const PLACEHOLDER_TEXT = /^(?:(?:slide|page)\s*\d+\s*)?(?:title|subtitle|heading|body|text|content|speaker notes|notes|bullet(?: point)?s?|point)(?:\s*\d+)?(?:\s+(?:here|goes here|text))?\.?$|lorem ipsum|^click to add\b/i; // look-act-look again, for things like opening a menu and then picking from it
 const ROLES = new Set(['menuitem', 'menu', 'tab', 'option', 'switch', 'treeitem', 'combobox']);
-const MAX_HISTORY = 6;
+const MAX_HISTORY = 14; // the employee's own messages are always kept (see cleanHistory)
 // "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
 const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link']);
 // fill on a document = write at the cursor; replace = swap the whole document for new text; clear = empty it
@@ -92,9 +92,13 @@ export function cleanSnapshot(raw) {
 // Only what the employee typed and what Agent said back; masked and capped. Never page content.
 export function cleanHistory(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.slice(-MAX_HISTORY)
-    .filter((h) => h && (h.who === 'you' || h.who === 'agent') && String(h.text ?? '').trim())
-    .map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
+  let list = raw.filter((h) => h && (h.who === 'you' || h.who === 'agent') && String(h.text ?? '').trim()).slice(-40);
+  // Drop Agent's own older notes first, so the employee's words (what the task IS) never fall out of view.
+  while (list.length > MAX_HISTORY) {
+    const i = list.findIndex((h) => h.who === 'agent');
+    list.splice(i === -1 || list.filter((h) => h.who === 'you').length > 6 ? 0 : i, 1);
+  }
+  return list.map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
 }
 
 // How much page we hand the model in one request. Hosted models cap how much they read per minute (Groq's free
@@ -111,6 +115,14 @@ export function appTips(host, url = '') {
   if (h === 'docs.google.com' && /\/document\//.test(u)) return 'Google Docs: the page is one document. Add with "fill", rewrite with "replace", answer at a spot with "insert".';
   if (/(^|\.)outlook\.(office|live)\.com$/.test(h)) return 'Outlook: click "New mail", fill "To", "Add a subject", then the message body. Never click "Send" unless asked.';
   return '';
+}
+
+// The whole task in the employee's own words, so a long job ("3 slides on X, then add the history to slide 2")
+// isn't forgotten halfway: follow-ups like "keep going" or "you didn't add the history" only make sense with it.
+function goalLines(history, request) {
+  const asks = history.filter((h) => h.who === 'you').map((h) => h.text);
+  if (!asks.length || (asks.length === 1 && asks[0] === clip(request, 300))) return '';
+  return `THE TASK SO FAR, in the employee's own words (oldest first). Keep ALL of it in mind and finish what's still missing:\n${asks.map((a, i) => `${i + 1}. ${a}`).join('\n')}\n\n`;
 }
 
 export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET, failure = '', url = '' } = {}) {
@@ -163,7 +175,8 @@ Documents and editors (kind "document": a Google Doc, an email body, a notes edi
 - "clear" deletes everything. "undo" takes back your last change ("value": "all" to undo every change you made, back to the original).
 - Slides and other editors can have several text boxes, each listed as its own document (for example 'Text box "Click to add title"'). Write into the right one; a box showing "Click to add..." is empty.
 - Write the REAL content they asked for, about their topic (a deck about dogs and cats gets real titles and real points about dogs and cats). Never type placeholder text like "Slide 1 Title", "Subtitle here" or "Speaker notes here".
-- When the whole task is finished, return no steps, "more": false, and say what you did.
+- When the whole task is finished, return no steps, "more": false, and say what you did. Before saying it's finished, check the page text: is every part they asked for really there (every slide, every section, with real content)? If not, keep going.
+- Don't ask the employee for content you can write yourself. "Add the history of Pagani" means YOU write a short history of Pagani.
 - Text format: a line "# Title" is the title, "## Heading" a heading, a blank line between paragraphs. Never run paragraphs together.
 - Style (optional, on fill/replace): "style": {"font": "Times New Roman", "size": 12, "spacing": "single"|"1.5"|"double", "indent": true|false (first-line indent), "align": "left"|"center"|"right"|"justify"}.
 - New text automatically matches the document's current style. Only give a style when they ask for a different look, and then keep it the same for every paragraph.
@@ -186,7 +199,7 @@ ${text || '(none)'}
 Things you can act on:
 ${list || '(nothing)'}
 ${snapshot.frames?.length ? `\nPanels you can't see inside: ${snapshot.frames.map((f) => `"${f.label || 'panel'}"${f.host ? ` (${f.host})` : ''}`).join(', ')}\n` : ''}
-${appTips(snapshot.host, url) ? `Tips for this app: ${appTips(snapshot.host, url)}\n\n` : ''}${failure ? `YOUR LAST TRY DIDN'T WORK: ${failure}\nDon't repeat the same thing. Try another way: a different element, the keyboard (fill then submit), a menu, or a step that shows what you need first. If there's truly no way, say what the employee should do.\n\n` : ''}${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
+${appTips(snapshot.host, url) ? `Tips for this app: ${appTips(snapshot.host, url)}\n\n` : ''}${failure ? `YOUR LAST TRY DIDN'T WORK: ${failure}\nDon't repeat the same thing. Try another way: a different element, the keyboard (fill then submit), a menu, or a step that shows what you need first. If there's truly no way, say what the employee should do.\n\n` : ''}${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${goalLines(history, request)}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
   return { system, user };
 }
 
