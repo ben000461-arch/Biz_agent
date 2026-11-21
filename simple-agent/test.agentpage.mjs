@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { cleanSnapshot, cleanHistory, cleanShot, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
+import { appTips, cleanFailure, cleanSnapshot, cleanHistory, cleanShot, cleanStyle, checkMath, checkPlan, maskSensitive, planPrompt, MAX_STEPS, MAX_ROUNDS } from './agentpage.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { if (c) { pass++; console.log(`  PASS  ${n}`); } else { fail++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ''}`); } };
@@ -140,6 +140,14 @@ console.log('\n[unit]');
   check('with a screenshot the prompt explains the number tags and the Agent bar', /tag 12 is element e12/.test(sp2) && /"Agent" bar at the bottom/.test(sp2) && !/SCREENSHOT/.test(planPrompt(c.snapshot, 'x').system));
   const wsnap = cleanSnapshot({ url: 'https://x.com/', title: 'X', text: '', elements: [{ id: 'e1', kind: 'field', label: 'To', where: 'dialog' }, { id: 'e2', kind: 'button', label: 'Old', offscreen: true, where: 'nowhere' }] }).snapshot;
   check('where things are (pop-up window, off screen) reaches the model', wsnap.elements[0].where === 'dialog' && wsnap.elements[1].offscreen === true && !wsnap.elements[1].where && /"To" \| in a pop-up window/.test(planPrompt(wsnap, 'x').user) && /"Old" \| off screen/.test(planPrompt(wsnap, 'x').user));
+
+  // retry with the reason, and app know-how
+  const fp = planPrompt(c.snapshot, 'x', [], 2, { failure: cleanFailure('Fill "Email": the field didn’t accept that value. SSN 123-45-6789') }).user;
+  check('a failed try is told to the model, masked, with "try another way"', /YOUR LAST TRY DIDN'T WORK: Fill "Email"/.test(fp) && /Try another way/.test(fp) && !/123-45-6789/.test(fp));
+  check('no failure, no failure line', !/LAST TRY/.test(planPrompt(c.snapshot, 'x').user));
+  check('Gmail and Slides get their own tips; other sites none', /click "Compose" first/.test(appTips('mail.google.com')) && /title box/.test(appTips('docs.google.com', 'https://docs.google.com/presentation/d/x/edit')) && appTips('example.com') === '');
+  const gm = cleanSnapshot({ url: 'https://mail.google.com/mail/u/0/', title: 'Inbox', text: '', elements: [{ id: 'e1', kind: 'button', label: 'Compose' }] }).snapshot;
+  check('tips are in the prompt on that site', /Tips for this app: Gmail/.test(planPrompt(gm, 'x', [], 1, { url: 'https://mail.google.com/mail/u/0/' }).user));
 
   // look again (multi-step tasks)
   check('"more" passes through when there are steps', checkPlan({ more: true, steps: [{ do: 'click', id: 'e2' }] }, tools, 1).more === true);

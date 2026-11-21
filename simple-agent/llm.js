@@ -27,7 +27,8 @@ export function createLLM({
   groqKey = '',
   groqBase = 'https://api.groq.com/openai/v1',
   ollamaHost = 'http://127.0.0.1:11434',
-  models = {},                       // { small, large, local } real model names
+  models = {},                       // { small, large, local, vision } real model names
+  agent = null,                      // optional { base, key, model }: a stronger model (any OpenAI-style provider) for Agent's page plans
   fetchImpl = globalThis.fetch,
   retryDelayMs = 400,
   log = () => {},                    // log(receiptObject) — metadata only, never message text
@@ -37,14 +38,17 @@ export function createLLM({
     large: models.large || 'openai/gpt-oss-120b',
     local: models.local || 'llama3.2:3b',
     vision: models.vision || 'qwen/qwen3.8-27b',
+    agent: agent?.model || null,
   };
-  const hosted = (tier) => tier === 'small' || tier === 'large' || tier === 'vision';
-  const available = (tier) => (hosted(tier) ? Boolean(groqKey) && Boolean(names[tier]) : tier === 'local');
+  const hosted = (tier) => tier === 'small' || tier === 'large' || tier === 'vision' || tier === 'agent';
+  const keyFor = (tier) => (tier === 'agent' ? agent?.key || '' : groqKey);
+  const baseFor = (tier) => (tier === 'agent' ? String(agent?.base || '').replace(/\/+$/, '') : groqBase);
+  const available = (tier) => (tier === 'agent' ? Boolean(agent?.base && agent?.key && agent?.model) : hosted(tier) ? Boolean(groqKey) && Boolean(names[tier]) : tier === 'local');
 
   // One attempt against one model. Returns { text, usage } or throws { retryable, message }.
   async function once(tier, { system, user, history, json, temperature, maxTokens, timeoutMs, image }) {
     // a picture goes along only to the vision model; it is never logged or kept
-    const userContent = image && tier === 'vision' ? [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: image } }] : user;
+    const userContent = image && (tier === 'vision' || tier === 'agent') ? [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: image } }] : user;
     const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: userContent }];
     let res;
     try {
@@ -54,9 +58,9 @@ export function createLLM({
           ...(json ? { response_format: { type: 'json_object' } } : {}),
           ...(isReasoning(names[tier]) ? { reasoning_effort: 'low' } : {}),
         };
-        res = await fetchImpl(`${groqBase}/chat/completions`, {
+        res = await fetchImpl(`${baseFor(tier)}/chat/completions`, {
           method: 'POST', signal: AbortSignal.timeout(timeoutMs),
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${groqKey}` },
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${keyFor(tier)}` },
           body: JSON.stringify(body),
         });
       } else {
@@ -73,7 +77,7 @@ export function createLLM({
       // 429 / 5xx are worth one more try; 400/401/403/404 mean this model will not work for us right now.
       let detail = '';
       try { detail = JSON.parse(await res.text())?.error?.message || ''; } catch { /* no readable reason */ }
-      detail = String(detail).replace(/gsk_[A-Za-z0-9_-]+/g, '[key]').replace(/\s+/g, ' ').slice(0, 140); // the reason helps; a key never appears
+      detail = String(detail).replace(/(gsk|sk|sk-ant|sk-or)[-_][A-Za-z0-9_-]+/g, '[key]').replace(/\s+/g, ' ').slice(0, 140); // the reason helps; a key never appears
       // "Request too large" won't fit on a second try either, so don't spend the per-minute allowance retrying it
       throw { retryable: (res.status === 429 && !/too large/i.test(detail)) || res.status >= 500, message: `http ${res.status}${detail ? `: ${detail}` : ''}` };
     }

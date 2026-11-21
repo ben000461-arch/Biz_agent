@@ -100,7 +100,18 @@ export function cleanHistory(raw) {
 // useful things first (new, on screen); we keep as many as fit and say how many were left out.
 export const PROMPT_BUDGET = { text: 2500, user: 9000 }; // characters (about 4 per token)
 
-export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET } = {}) {
+// Short know-how for the apps offices live in. Added to the prompt only on that site.
+export function appTips(host, url = '') {
+  const h = String(host || '').toLowerCase(), u = String(url || '');
+  if (h === 'mail.google.com') return 'Gmail: to write an email, click "Compose" first, then fill "To recipients", then "Subject", then the "Message Body" (a document). Never click "Send" unless the employee clearly asked to send. A draft saves on its own.';
+  if (h === 'docs.google.com' && /\/presentation\//.test(u)) return 'Google Slides: each slide\'s boxes are listed as Text box "...". Write the title in the title box and the rest in the body box. To add a slide, click "New slide" and look again before writing on it.';
+  if (h === 'docs.google.com' && /\/spreadsheets\//.test(u)) return 'Google Sheets: click the "Name Box", type a cell like B2, press Enter (submit), then type the value into the cell editor.';
+  if (h === 'docs.google.com' && /\/document\//.test(u)) return 'Google Docs: the page is one document. Add with "fill", rewrite with "replace", answer at a spot with "insert".';
+  if (/(^|\.)outlook\.(office|live)\.com$/.test(h)) return 'Outlook: click "New mail", fill "To", "Add a subject", then the message body. Never click "Send" unless asked.';
+  return '';
+}
+
+export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET, failure = '', url = '' } = {}) {
   const lines = snapshot.elements.map((e) => {
     let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''}${e.role ? ` (${e.role})` : ''} | "${clip(e.label, 90)}"`;
     if (e.popup) line += ' | opens a menu';
@@ -171,7 +182,7 @@ ${text || '(none)'}
 Things you can act on:
 ${list || '(nothing)'}
 ${snapshot.frames?.length ? `\nPanels you can't see inside: ${snapshot.frames.map((f) => `"${f.label || 'panel'}"${f.host ? ` (${f.host})` : ''}`).join(', ')}\n` : ''}
-${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
+${appTips(snapshot.host, url) ? `Tips for this app: ${appTips(snapshot.host, url)}\n\n` : ''}${failure ? `YOUR LAST TRY DIDN'T WORK: ${failure}\nDon't repeat the same thing. Try another way: a different element, the keyboard (fill then submit), a menu, or a step that shows what you need first. If there's truly no way, say what the employee should do.\n\n` : ''}${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
   return { system, user };
 }
 
@@ -289,4 +300,9 @@ export function cleanShot(x) {
   if (typeof x !== 'string' || x.length > MAX_SHOT_CHARS) return null;
   const m = x.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/);
   return m && m[2].length > 100 ? x : null;
+}
+
+// What went wrong on the last try, in plain words from the extension (masked, short). Never page content beyond that.
+export function cleanFailure(x) {
+  return maskSensitive(clip(String(x ?? ''), 400)).replace(/\s+/g, ' ').trim();
 }
