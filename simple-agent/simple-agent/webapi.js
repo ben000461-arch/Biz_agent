@@ -20,7 +20,7 @@ import { createLimiter } from './webchat.js';
 const ID_RE = /^a[0-9a-f]{4,12}$/;
 const VERBS = new Set(['run', 'pause', 'resume', 'delete', 'schedule', 'update']);
 
-export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {}, onError = () => {} }) {
+export function mountWebApi(app, { express, auth, getTenant, ops, office = null, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {}, onError = () => {} }) {
   const allowed = new Set([siteOrigin, ...extraOrigins].filter(Boolean));
   const userLimit = createLimiter({ max: perUserPerMinute });
   const ipLimit = createLimiter({ max: perIpPerMinute });
@@ -56,6 +56,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
       const tenant = link.chatId ? getTenant(link.chatId) : null;
       if (!tenant) return res.status(409).json({ error: 'not_linked' });
       req.tenant = tenant;
+      req.userId = v.userId;
       next();
     } catch (err) {
       try { onError('sign-in check', err); } catch { /* ignore */ }
@@ -89,7 +90,48 @@ export function mountWebApi(app, { express, auth, getTenant, ops, siteOrigin, ex
   const planJson = express.json({ limit: '2mb' }); // ...and a plan may also carry one screenshot
   router.options(['/agent/plan', '/agent/log'], corsAgent, (_req, res) => res.status(204).end());
   router.post('/agent/plan', corsAgent, limitIp, planJson, who, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
-  router.post('/agent/log', corsAgent, limitIp, json, who, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
+  router.post('/agent/log', corsAgent, limitIp, bigJson, who, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId)));
+
+  // ---- the Office dashboard (owner / employee). Signed in with the same login; reads only that person's
+  //      business, and only their own work unless they're the owner.
+  const whoOffice = async (req, res, next) => {
+    try {
+      if (!office?.enabled) return res.status(503).json({ error: 'try again in a moment' });
+      const m = /^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '');
+      const v = await auth.verify(m ? m[1] : '');
+      if (v.error === 'unauthorized') return res.status(401).json({ error: 'sign in again' });
+      if (v.error) return res.status(503).json({ error: 'try again in a moment' });
+      if (!userLimit(v.userId)) return res.status(429).json({ error: 'slow down a little' });
+      const member = await office.member(v.userId);
+      if (member.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
+      if (member.error) return res.status(403).json({ error: 'not_member', message: 'This login isn’t part of an office yet. Ask your office’s owner to add your email.' });
+      req.member = { ...member, userId: v.userId };
+      next();
+    } catch (err) {
+      try { onError('office sign-in check', err); } catch { /* ignore */ }
+      res.status(500).json({ error: 'something went wrong' });
+    }
+  };
+  const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team'], cors, (_req, res) => res.status(204).end());
+  router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
+    const b = await office.business(req.member.chatId);
+    return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name } };
+  }));
+  router.get('/office/activity', cors, limitIp, whoOffice, run(async (req) => {
+    const limit = 30;
+    const a = await office.activity(req.member, { person: person(req), before: String(req.query.before || ''), limit: limit + 1 });
+    if (a.error) return { status: 503, body: { error: 'try again in a moment' } };
+    return { body: { rows: a.rows.slice(0, limit), more: a.rows.length > limit } };
+  }));
+  router.get('/office/summary', cors, limitIp, whoOffice, run(async (req) => {
+    const s = await office.summary(req.member, { person: person(req) });
+    return s.error ? { status: 503, body: { error: 'try again in a moment' } } : { body: s };
+  }));
+  router.get('/office/team', cors, limitIp, whoOffice, run(async (req) => {
+    const t = await office.team(req.member);
+    return t.error ? { status: 503, body: { error: 'try again in a moment' } } : { body: t };
+  }));
   router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
   router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));
   router.post('/account/delete', cors, limitIp, json, who, run((req) => ops.deleteAccount(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));

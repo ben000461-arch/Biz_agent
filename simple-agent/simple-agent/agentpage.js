@@ -24,9 +24,9 @@ const PLACEHOLDER_TEXT = /^(?:(?:slide|page)\s*\d+\s*)?(?:title|subtitle|heading
 const ROLES = new Set(['menuitem', 'menu', 'tab', 'option', 'switch', 'treeitem', 'combobox']);
 const MAX_HISTORY = 14; // the employee's own messages are always kept (see cleanHistory)
 // "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
-const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link']);
+const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link', 'tab']); // tab = another browser tab
 // fill on a document = write at the cursor; replace = swap the whole document for new text; clear = empty it
-const ACTIONS = { insert: ['document'], submit: ['field'], fill: ['field', 'textarea', 'document'], replace: ['document'], clear: ['document'], undo: ['document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
+const ACTIONS = { insert: ['document'], submit: ['field'], fill: ['field', 'textarea', 'document'], replace: ['document'], clear: ['document'], undo: ['document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'], switch: ['tab'], open: [] };
 
 const clip = (s, n) => String(s ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').slice(0, n);
 
@@ -154,6 +154,7 @@ ${screenshot ? `You also get a SCREENSHOT of what the employee sees. Each thing 
 Rules:
 - Use ONLY the element ids listed (like "e7"). Never invent ids.
 - Actions: "fill" (type into a field), "submit" (press Enter in a field), "select" (pick a listed option, exactly as written), "check"/"uncheck", "click" (buttons, links, menus, tabs).
+- Other browser tabs are listed as "tab" (e.g. Browser tab "Inbox" (mail.google.com)). To go to one: {"do":"switch","id":"<its id>"}. To open a page in a new tab: {"do":"open","value":"https://..."} (no id). Use these when the task needs another page; you'll get a fresh look at it right after, so make "switch"/"open" your LAST step and set "more": true.
 - Things marked NEW just appeared after your last step (a dialog, a compose window, a menu). They're usually what you need next.
 - Choices (radio buttons, checkboxes, ratings) are listed as "Question: option". Use "check" on the option to pick.
 - Never make up answers about the employee themselves: how they feel, what they did, their opinions, personal check-ins and surveys. Leave those out and ask them in "say". Leave optional "Other" boxes empty unless they're needed.
@@ -217,6 +218,14 @@ export function cleanStyle(st) {
 }
 
 // Check the model's plan against the snapshot. Bad steps are dropped and reported, never "fixed up".
+// a web address Agent may open: http or https only, no logins in the address, no local network
+export function safeUrl(v) {
+  let u; try { u = new URL(String(v ?? '').trim()); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || u.username || u.password || u.href.length > 1000) return null;
+  if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0|\[)/i.test(u.hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(u.hostname)) return null;
+  return u;
+}
+
 export function checkPlan(data, snapshot, round = 1) {
   const byId = new Map(snapshot.elements.map((e) => [e.id, e]));
   const steps = [];
@@ -227,6 +236,12 @@ export function checkPlan(data, snapshot, round = 1) {
     const action = String(s?.do || '').toLowerCase();
     const el = byId.get(String(s?.id || ''));
     if (!ACTIONS[action]) { dropped.push(`unknown action "${clip(action, 20)}"`); continue; }
+    if (action === 'open') { // open a web page in a new tab: only plain http(s) addresses
+      const u = safeUrl(s?.value);
+      if (!u) { dropped.push(`"${clip(s?.value, 60)}" isn't a web address I can open`); continue; }
+      steps.push({ do: 'open', id: '', label: `Open ${u.hostname.replace(/^www\./, '')}`, kind: 'page', value: u.href });
+      continue;
+    }
     if (!el) { dropped.push(`unknown element "${clip(s?.id, 12)}"`); continue; }
     if (!ACTIONS[action].includes(el.kind)) { dropped.push(`can't ${action} ${el.kind} "${el.label}"`); continue; }
     if (action === 'click' && /\(showing now\)/.test(el.label)) { dropped.push(`"${el.label}" is already showing`); continue; } // no need to click it, and no reason to stop and look again
@@ -269,13 +284,15 @@ export function checkPlan(data, snapshot, round = 1) {
   // "Insert → Image" can still run as one plan.
   // (Only when the NEXT step is a click too, i.e. picking from the menu. "New slide" has a little menu arrow, but
   // typing right after it would aim at the old slide.)
-  const clickAt = steps.findIndex((st, i) => st.do === 'click' && !(byId.get(st.id)?.popup && steps[i + 1]?.do === 'click'));
+  const moves = (st) => st.do === 'open' || st.do === 'switch'; // going to another tab: carry on over there
+  const clickAt = steps.findIndex((st, i) => moves(st) || (st.do === 'click' && !(byId.get(st.id)?.popup && steps[i + 1]?.do === 'click')));
   let cutAfterClick = false;
   if (clickAt !== -1 && clickAt < steps.length - 1) {
     for (const st of steps.splice(clickAt + 1)) dropped.push(`"${st.label}" waits until I look again after the click`);
     cutAfterClick = true;
   }
   const auto = steps.length > 0 && steps.length <= AUTO_MAX_STEPS && steps.every((st) => {
+    if (st.do === 'open' || st.do === 'switch') return true; // just looking at another page; nothing changes
     const el = byId.get(st.id);
     if (st.do === 'fill') return el.kind === 'document' || !el.value;
     if (st.do === 'insert') return !st.swap || /_{3,}/.test(st.find); // adding next to text, or filling a blank line
@@ -285,7 +302,8 @@ export function checkPlan(data, snapshot, round = 1) {
     if (st.do === 'submit') return el.search === true; // Enter in a search box only searches; in a form it may send
     return st.do === 'select' || st.do === 'check' || st.do === 'uncheck';
   });
-  const endsWithClick = steps.length > 0 && steps[steps.length - 1].do === 'click' && !byId.get(steps[steps.length - 1].id)?.search;
+  const lastStep = steps[steps.length - 1];
+  const endsWithClick = steps.length > 0 && (lastStep.do === 'open' || lastStep.do === 'switch' || (lastStep.do === 'click' && !byId.get(lastStep.id)?.search));
   const more = (data?.more === true || cutAfterClick || endsWithClick) && steps.length > 0 && round < MAX_ROUNDS;
   // math that doesn't add up is flagged and never runs on its own
   const mathWarnings = steps.flatMap((st) => checkMath(st.value).map((m) => `Check this math in "${st.label}": ${m}`)).slice(0, 5);

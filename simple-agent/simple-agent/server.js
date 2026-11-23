@@ -53,6 +53,7 @@ import { mountToolConn } from './toolconn.js';
 import { parseWhen, parseDuration, deriveTitle, looksLikeBooking, formatWhen, tzAbbrev, clock12, validTz, zonedParts, parseSchedule, describeSchedule, dueAt, nextRuns, localDate, startOfLocalDay, fromLocal, fixBookingTypos } from './when.js';
 import * as agentKit from './agents.js';
 import { mountWebApi } from './webapi.js';
+import { createOffice } from './office.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2515,6 +2516,7 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 // The website's chat box. Same engine as Telegram; the answer goes back to the page instead.
 // Only the website's own address may call it (SITE_URL, plus WEB_ORIGINS if you list more, comma-separated).
 const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
+const office = createOffice({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY }); // the Office dashboard's data (supabase/office.sql)
 mountBilling(app, { auth: webAuth, entitlements, getTenant: (chatId) => store.get(chatId), supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, log: console.log, notify: (text) => (ADMIN_ID ? sendTelegramMessage(ADMIN_ID, '💳 ' + text) : null) });
 const toolReq = mountToolRequests(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, adminId: ADMIN_ID, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), describeChat: (chatId) => store.get(chatId)?.name || store.get(chatId)?.business || '', log: console.log });
 const toolConn = mountToolConn(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), log: console.log });
@@ -2607,7 +2609,11 @@ const webOps = {
     return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, saw, ...(warning ? { warning } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
-  async agentLog(tenant, b) {
+  async agentLog(tenant, b, userId) {
+    // the Office dashboard's activity list: what was asked, where, each step's name and whether it worked
+    if (office.enabled && userId) {
+      office.member(userId).then((m) => (m.error ? null : office.logTask({ ...m, userId }, b))).catch(() => {});
+    }
     const outcome = ['done', 'partial', 'failed', 'cancelled'].includes(b.outcome) ? b.outcome : null;
     if (!outcome) return { status: 400, body: { error: 'invalid' } };
     let host = '';
@@ -2773,6 +2779,7 @@ const webOps = {
 mountWebApi(app, {
   express,
   auth: webAuth,
+  office,
   getTenant: (chatId) => store.get(chatId),
   ops: webOps,
   siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
