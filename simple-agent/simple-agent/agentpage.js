@@ -22,11 +22,11 @@ export const MAX_ROUNDS = 10;
 // "Slide 1 Title", "Subtitle here", "Speaker notes here", "Body text", "Lorem ipsum"...: not real content
 const PLACEHOLDER_TEXT = /^(?:(?:slide|page)\s*\d+\s*)?(?:title|subtitle|heading|body|text|content|speaker notes|notes|bullet(?: point)?s?|point)(?:\s*\d+)?(?:\s+(?:here|goes here|text))?\.?$|lorem ipsum|^click to add\b/i; // look-act-look again, for things like opening a menu and then picking from it
 const ROLES = new Set(['menuitem', 'menu', 'tab', 'option', 'switch', 'treeitem', 'combobox']);
-const MAX_HISTORY = 6;
+const MAX_HISTORY = 14; // the employee's own messages are always kept (see cleanHistory)
 // "document" = the body of an editor like Google Docs: filling it types at the cursor (never replaces the doc)
-const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link']);
+const KINDS = new Set(['field', 'textarea', 'document', 'select', 'checkbox', 'radio', 'button', 'link', 'tab']); // tab = another browser tab
 // fill on a document = write at the cursor; replace = swap the whole document for new text; clear = empty it
-const ACTIONS = { insert: ['document'], submit: ['field'], fill: ['field', 'textarea', 'document'], replace: ['document'], clear: ['document'], undo: ['document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'] };
+const ACTIONS = { insert: ['document'], submit: ['field'], fill: ['field', 'textarea', 'document'], replace: ['document'], clear: ['document'], undo: ['document'], select: ['select'], check: ['checkbox', 'radio'], uncheck: ['checkbox'], click: ['button', 'link', 'checkbox', 'radio'], switch: ['tab'], open: [] };
 
 const clip = (s, n) => String(s ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').slice(0, n);
 
@@ -92,9 +92,13 @@ export function cleanSnapshot(raw) {
 // Only what the employee typed and what Agent said back; masked and capped. Never page content.
 export function cleanHistory(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.slice(-MAX_HISTORY)
-    .filter((h) => h && (h.who === 'you' || h.who === 'agent') && String(h.text ?? '').trim())
-    .map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
+  let list = raw.filter((h) => h && (h.who === 'you' || h.who === 'agent') && String(h.text ?? '').trim()).slice(-40);
+  // Drop Agent's own older notes first, so the employee's words (what the task IS) never fall out of view.
+  while (list.length > MAX_HISTORY) {
+    const i = list.findIndex((h) => h.who === 'agent');
+    list.splice(i === -1 || list.filter((h) => h.who === 'you').length > 6 ? 0 : i, 1);
+  }
+  return list.map((h) => ({ who: h.who, text: clip(maskSensitive(clip(h.text, 400)).replace(/\s+/g, ' ').trim(), 300) }));
 }
 
 // How much page we hand the model in one request. Hosted models cap how much they read per minute (Groq's free
@@ -106,11 +110,19 @@ export const PROMPT_BUDGET = { text: 2500, user: 9000 }; // characters (about 4 
 export function appTips(host, url = '') {
   const h = String(host || '').toLowerCase(), u = String(url || '');
   if (h === 'mail.google.com') return 'Gmail: to write an email, click "Compose" first, then fill "To recipients", then "Subject", then the "Message Body" (a document). Never click "Send" unless the employee clearly asked to send. A draft saves on its own.';
-  if (h === 'docs.google.com' && /\/presentation\//.test(u)) return 'Google Slides: each slide\'s boxes are listed as Text box "...". Write the title in the title box and the rest in the body box. To add a slide, click "New slide" and look again before writing on it. A content slide should have a title box and a body box ("Click to add text"); if a new slide only has a title and subtitle, click "Layout" and pick "Title and body" first. "Speaker notes" are NOT on the slide: only write there if asked.';
+  if (h === 'docs.google.com' && /\/presentation\//.test(u)) return 'Google Slides: each slide\'s boxes are listed as Text box "...". Write the title in the title box and the rest in the body box. To add a slide, click "New slide" and look again before writing on it. A content slide should have a title box and a body box ("Click to add text"); if a new slide only has a title and subtitle, click "Layout" and pick "Title and body" first. "Speaker notes" are NOT on the slide: only write there if asked. The slide marked "(showing now)" is the one on screen: write on it directly, do not click it. Make exactly as many slides as asked (count the slides listed). To delete a slide: click it, then the "Slide" menu, then "Delete slide". If the box you need is not listed, use "Spot on the slide: title area" or "Spot on the slide: main text area" instead: Agent finds the box there by double-clicking around that part of the slide.';
   if (h === 'docs.google.com' && /\/spreadsheets\//.test(u)) return 'Google Sheets: click the "Name Box", type a cell like B2, press Enter (submit), then type the value into the cell editor.';
   if (h === 'docs.google.com' && /\/document\//.test(u)) return 'Google Docs: the page is one document. Add with "fill", rewrite with "replace", answer at a spot with "insert".';
   if (/(^|\.)outlook\.(office|live)\.com$/.test(h)) return 'Outlook: click "New mail", fill "To", "Add a subject", then the message body. Never click "Send" unless asked.';
   return '';
+}
+
+// The whole task in the employee's own words, so a long job ("3 slides on X, then add the history to slide 2")
+// isn't forgotten halfway: follow-ups like "keep going" or "you didn't add the history" only make sense with it.
+function goalLines(history, request) {
+  const asks = history.filter((h) => h.who === 'you').map((h) => h.text);
+  if (!asks.length || (asks.length === 1 && asks[0] === clip(request, 300))) return '';
+  return `THE TASK SO FAR, in the employee's own words (oldest first). Keep ALL of it in mind and finish what's still missing:\n${asks.map((a, i) => `${i + 1}. ${a}`).join('\n')}\n\n`;
 }
 
 export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET, failure = '', url = '' } = {}) {
@@ -142,6 +154,7 @@ ${screenshot ? `You also get a SCREENSHOT of what the employee sees. Each thing 
 Rules:
 - Use ONLY the element ids listed (like "e7"). Never invent ids.
 - Actions: "fill" (type into a field), "submit" (press Enter in a field), "select" (pick a listed option, exactly as written), "check"/"uncheck", "click" (buttons, links, menus, tabs).
+- Other browser tabs are listed as "tab" (e.g. Browser tab "Inbox" (mail.google.com)). To go to one: {"do":"switch","id":"<its id>"}. To open a page in a new tab: {"do":"open","value":"https://..."} (no id). Use these when the task needs another page; you'll get a fresh look at it right after, so make "switch"/"open" your LAST step and set "more": true.
 - Things marked NEW just appeared after your last step (a dialog, a compose window, a menu). They're usually what you need next.
 - Choices (radio buttons, checkboxes, ratings) are listed as "Question: option". Use "check" on the option to pick.
 - Never make up answers about the employee themselves: how they feel, what they did, their opinions, personal check-ins and surveys. Leave those out and ask them in "say". Leave optional "Other" boxes empty unless they're needed.
@@ -163,7 +176,8 @@ Documents and editors (kind "document": a Google Doc, an email body, a notes edi
 - "clear" deletes everything. "undo" takes back your last change ("value": "all" to undo every change you made, back to the original).
 - Slides and other editors can have several text boxes, each listed as its own document (for example 'Text box "Click to add title"'). Write into the right one; a box showing "Click to add..." is empty.
 - Write the REAL content they asked for, about their topic (a deck about dogs and cats gets real titles and real points about dogs and cats). Never type placeholder text like "Slide 1 Title", "Subtitle here" or "Speaker notes here".
-- When the whole task is finished, return no steps, "more": false, and say what you did.
+- When the whole task is finished, return no steps, "more": false, and say what you did. Before saying it's finished, check the page text: is every part they asked for really there (every slide, every section, with real content)? If not, keep going.
+- Don't ask the employee for content you can write yourself. "Add the history of Pagani" means YOU write a short history of Pagani.
 - Text format: a line "# Title" is the title, "## Heading" a heading, a blank line between paragraphs. Never run paragraphs together.
 - Style (optional, on fill/replace): "style": {"font": "Times New Roman", "size": 12, "spacing": "single"|"1.5"|"double", "indent": true|false (first-line indent), "align": "left"|"center"|"right"|"justify"}.
 - New text automatically matches the document's current style. Only give a style when they ask for a different look, and then keep it the same for every paragraph.
@@ -186,7 +200,7 @@ ${text || '(none)'}
 Things you can act on:
 ${list || '(nothing)'}
 ${snapshot.frames?.length ? `\nPanels you can't see inside: ${snapshot.frames.map((f) => `"${f.label || 'panel'}"${f.host ? ` (${f.host})` : ''}`).join(', ')}\n` : ''}
-${appTips(snapshot.host, url) ? `Tips for this app: ${appTips(snapshot.host, url)}\n\n` : ''}${failure ? `YOUR LAST TRY DIDN'T WORK: ${failure}\nDon't repeat the same thing. Try another way: a different element, the keyboard (fill then submit), a menu, or a step that shows what you need first. If there's truly no way, say what the employee should do.\n\n` : ''}${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
+${appTips(snapshot.host, url) ? `Tips for this app: ${appTips(snapshot.host, url)}\n\n` : ''}${failure ? `YOUR LAST TRY DIDN'T WORK: ${failure}\nDon't repeat the same thing. Try another way: a different element, the keyboard (fill then submit), a menu, or a step that shows what you need first. If there's truly no way, say what the employee should do.\n\n` : ''}${history.length ? `Earlier in this chat:\n${history.map((h) => `${h.who === 'you' ? 'Employee' : 'You'}: ${h.text}`).join('\n')}\n\n` : ''}${goalLines(history, request)}${round > 1 ? `(Look ${round}: you already did the steps above for this request; continue from the page as it is now.)\n` : ''}The employee asked: ${clip(request, 1000)}`;
   return { system, user };
 }
 
@@ -204,6 +218,14 @@ export function cleanStyle(st) {
 }
 
 // Check the model's plan against the snapshot. Bad steps are dropped and reported, never "fixed up".
+// a web address Agent may open: http or https only, no logins in the address, no local network
+export function safeUrl(v) {
+  let u; try { u = new URL(String(v ?? '').trim()); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || u.username || u.password || u.href.length > 1000) return null;
+  if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0|\[)/i.test(u.hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(u.hostname)) return null;
+  return u;
+}
+
 export function checkPlan(data, snapshot, round = 1) {
   const byId = new Map(snapshot.elements.map((e) => [e.id, e]));
   const steps = [];
@@ -214,8 +236,15 @@ export function checkPlan(data, snapshot, round = 1) {
     const action = String(s?.do || '').toLowerCase();
     const el = byId.get(String(s?.id || ''));
     if (!ACTIONS[action]) { dropped.push(`unknown action "${clip(action, 20)}"`); continue; }
+    if (action === 'open') { // open a web page in a new tab: only plain http(s) addresses
+      const u = safeUrl(s?.value);
+      if (!u) { dropped.push(`"${clip(s?.value, 60)}" isn't a web address I can open`); continue; }
+      steps.push({ do: 'open', id: '', label: `Open ${u.hostname.replace(/^www\./, '')}`, kind: 'page', value: u.href });
+      continue;
+    }
     if (!el) { dropped.push(`unknown element "${clip(s?.id, 12)}"`); continue; }
     if (!ACTIONS[action].includes(el.kind)) { dropped.push(`can't ${action} ${el.kind} "${el.label}"`); continue; }
+    if (action === 'click' && /\(showing now\)/.test(el.label)) { dropped.push(`"${el.label}" is already showing`); continue; } // no need to click it, and no reason to stop and look again
     const step = { do: action, id: el.id, label: el.label || el.kind, kind: el.kind };
     if (action === 'fill' || action === 'replace') {
       if (s.value == null || String(s.value).trim() === '') { dropped.push(`no value for "${el.label}"`); continue; }
@@ -255,13 +284,15 @@ export function checkPlan(data, snapshot, round = 1) {
   // "Insert → Image" can still run as one plan.
   // (Only when the NEXT step is a click too, i.e. picking from the menu. "New slide" has a little menu arrow, but
   // typing right after it would aim at the old slide.)
-  const clickAt = steps.findIndex((st, i) => st.do === 'click' && !(byId.get(st.id)?.popup && steps[i + 1]?.do === 'click'));
+  const moves = (st) => st.do === 'open' || st.do === 'switch'; // going to another tab: carry on over there
+  const clickAt = steps.findIndex((st, i) => moves(st) || (st.do === 'click' && !(byId.get(st.id)?.popup && steps[i + 1]?.do === 'click')));
   let cutAfterClick = false;
   if (clickAt !== -1 && clickAt < steps.length - 1) {
     for (const st of steps.splice(clickAt + 1)) dropped.push(`"${st.label}" waits until I look again after the click`);
     cutAfterClick = true;
   }
   const auto = steps.length > 0 && steps.length <= AUTO_MAX_STEPS && steps.every((st) => {
+    if (st.do === 'open' || st.do === 'switch') return true; // just looking at another page; nothing changes
     const el = byId.get(st.id);
     if (st.do === 'fill') return el.kind === 'document' || !el.value;
     if (st.do === 'insert') return !st.swap || /_{3,}/.test(st.find); // adding next to text, or filling a blank line
@@ -271,7 +302,8 @@ export function checkPlan(data, snapshot, round = 1) {
     if (st.do === 'submit') return el.search === true; // Enter in a search box only searches; in a form it may send
     return st.do === 'select' || st.do === 'check' || st.do === 'uncheck';
   });
-  const endsWithClick = steps.length > 0 && steps[steps.length - 1].do === 'click' && !byId.get(steps[steps.length - 1].id)?.search;
+  const lastStep = steps[steps.length - 1];
+  const endsWithClick = steps.length > 0 && (lastStep.do === 'open' || lastStep.do === 'switch' || (lastStep.do === 'click' && !byId.get(lastStep.id)?.search));
   const more = (data?.more === true || cutAfterClick || endsWithClick) && steps.length > 0 && round < MAX_ROUNDS;
   // math that doesn't add up is flagged and never runs on its own
   const mathWarnings = steps.flatMap((st) => checkMath(st.value).map((m) => `Check this math in "${st.label}": ${m}`)).slice(0, 5);
