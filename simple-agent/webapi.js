@@ -151,7 +151,8 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     if (r.error) { const [status, message] = TEAM_ERR[r.error] || [503, 'Try again in a moment.']; return { status, body: { error: r.error, message } }; }
     const note = r.existing ? 'They already have a login, so no email was needed: they can sign in with it now.'
       : r.sent ? 'Invite sent. They’ll get an email to set their password.'
-      : r.sent === false ? 'They’re added, but the invite email couldn’t be sent right now. Use “Send again” in a little while.' : '';
+      : r.emailError === 'rate_limited' ? 'They’re added, but too many emails went out this hour. Use “Send again” in a little while.'
+      : r.sent === false ? 'They’re added, but the invite email couldn’t be sent. Check the email settings in Supabase, then use “Send again”.' : '';
     return { body: { ok: true, sent: r.sent === true, existing: r.existing === true, emailProblem: r.sent === false && !r.existing, note } };
   };
   const inviteOpts = { redirectTo: siteOrigin ? `${siteOrigin}/office/` : undefined };

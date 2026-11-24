@@ -146,9 +146,12 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
       if (res.ok) return { sent: true };
       let body = ''; try { body = await res.text(); } catch { /* ignore */ }
       if (res.status === 422 || /already been registered|already registered|email_exists/i.test(body)) return { sent: false, existing: true }; // they already have a login: they just sign in
+      // say WHY in the bot log (Supabase's own error code and message; any email address in it is blanked out)
+      let why = ''; try { const j = JSON.parse(body); why = `${j.error_code || j.code || ''} ${j.msg || j.message || j.error_description || ''}`; } catch { why = body; }
+      console.warn(`[office] invite email not sent: HTTP ${res.status} ${String(why).replace(/[^\s@"']+@[^\s@"']+/g, '<email>').slice(0, 200)}`);
       if (res.status === 429 || /rate limit/i.test(body)) return { sent: false, emailError: 'rate_limited' };
       return { sent: false, emailError: 'email_failed' };
-    } catch { return { sent: false, emailError: 'email_failed' }; } finally { clearTimeout(t); }
+    } catch (e) { console.warn(`[office] invite email not sent: ${e?.name === 'AbortError' ? 'timed out' : 'could not reach Supabase'}`); return { sent: false, emailError: 'email_failed' }; } finally { clearTimeout(t); }
   }
 
   async function invite(m, { email, name } = {}, opts = {}) {
