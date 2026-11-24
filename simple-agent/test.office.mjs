@@ -86,6 +86,9 @@ check('another business never sees ours', JSON.stringify(reqs((await office.acti
 check('older pages: "before" an id', JSON.stringify(reqs((await office.activity(owner, { before: 3, limit: 5 })).rows)) === JSON.stringify(['add a line', 'Email Sam the totals, my SSN is [SSN hidden]']));
 const sum = await office.summary(owner);
 check('summary: last 7 days counted right', sum.tasks === 4 && sum.done === 2 && sum.problems === 1 && sum.approved === 2 && sum.auto === 1 && sum.denied === 1, sum);
+check('summary: 7 days for the chart, today last, counted by outcome', sum.days.length === 7 && sum.days[6].done === 2 && sum.days[6].problems === 1 && sum.days[6].denied === 1 && sum.today === 4, sum.days);
+check('summary: who did the most (owner only) and where', sum.people[0].email === 'emp@demo.test' && sum.people[0].tasks === 3 && sum.sites.length === 4 && sum.sites.some((x) => x.site === 'mail.google.com'), { p: sum.people, s: sum.sites });
+check('summary: employees don\'t get the team breakdown', (await office.summary(emp)).people.length === 0);
 check('summary: an employee gets their own numbers', (await office.summary(emp)).tasks === 3);
 const team = await office.team(owner);
 check('team: owner sees the people (not removed ones), invited ones marked', team.people.length === 3 && team.people.some((p) => p.email === 'new@demo.test' && p.status === 'invited') && !team.people.some((p) => p.email === 'gone@demo.test'), team);

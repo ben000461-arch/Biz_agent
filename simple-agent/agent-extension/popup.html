@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Agent</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="glass">
+    <header>
+      <img src="icons/icon32.png" alt="" width="28" height="28">
+      <b id="name">Agent</b>
+    </header>
+
+    <section id="signed-out" hidden>
+      <p class="muted">Sign in to your workspace.</p>
+      <form id="form" autocomplete="on">
+        <div class="row field">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg>
+          <input id="email" type="email" autocomplete="username" placeholder="Email" aria-label="Email" required>
+        </div>
+        <div class="row field">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+          <input id="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" required>
+        </div>
+        <button id="go" class="primary" type="submit">Sign in</button>
+      </form>
+      <p id="msg" class="msg" role="status" hidden></p>
+    </section>
+
+    <section id="signed-in" hidden>
+      <button id="open" class="row action" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg>
+        <span>Open Agent on this page</span>
+      </button>
+      <div class="row info">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="18" height="12" rx="2"/><path d="M7 11h.01M11 11h.01M15 11h.01M8 15h8"/></svg>
+        <span>Shortcut: <kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>A</kbd></span>
+      </div>
+      <label class="row info toggle">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>
+        <span class="t"><b>Run small tasks on their own</b><small id="auto-note">Typing, filling and opening menus run right away. Other clicks, deleting and rewriting still ask you.</small></span>
+        <input id="auto" type="checkbox" role="switch">
+      </label>
+      <label class="row info toggle">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2"/><circle cx="12" cy="11.5" r="3"/></svg>
+        <span class="t"><b>Let Agent see the screen</b><small id="shot-note">A picture of this tab helps Agent find the right spot. Private fields are blacked out, and nothing is saved.</small></span>
+        <input id="shots" type="checkbox" role="switch">
+      </label>
+      <p id="msg2" class="msg" role="status" hidden></p>
+      <div class="foot">
+        <span class="muted small" id="who"></span>
+        <button id="out" class="link" type="button">Sign out</button>
+      </div>
+    </section>
+  </div>
+  <p class="powered">Powered by co|op</p>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
