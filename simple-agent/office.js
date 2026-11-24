@@ -93,7 +93,25 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     if (a.error) return a;
     const rows = a.rows;
     const count = (f) => rows.filter(f).length;
+    // per day (this computer's time zone, oldest first) for the chart, and who / where for the side cards
+    const dayKey = (t) => { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+    const days = [];
+    for (let i = 6; i >= 0; i--) days.push({ date: dayKey(now() - i * 864e5), done: 0, problems: 0, denied: 0 });
+    const byDate = new Map(days.map((d) => [d.date, d]));
+    const people = new Map(), sites = new Map();
+    for (const r of rows) {
+      const d = byDate.get(dayKey(r.ts));
+      if (d) { if (r.outcome === 'done') d.done++; else if (r.outcome === 'cancelled') d.denied++; else d.problems++; }
+      const e = String(r.email || '').toLowerCase();
+      if (e) { const p = people.get(e) || { email: e, tasks: 0, done: 0 }; p.tasks++; if (r.outcome === 'done') p.done++; people.set(e, p); }
+      if (r.site) sites.set(r.site, (sites.get(r.site) || 0) + 1);
+    }
     return {
+      days,
+      today: days[6].done + days[6].problems + days[6].denied,
+      partial: count((r) => r.outcome === 'partial'),
+      people: m.role === 'owner' ? [...people.values()].sort((a, b) => b.tasks - a.tasks).slice(0, 6) : [],
+      sites: [...sites.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([site, tasks]) => ({ site, tasks })),
       tasks: rows.length,
       done: count((r) => r.outcome === 'done'),
       problems: count((r) => r.outcome === 'failed' || r.outcome === 'partial'),
