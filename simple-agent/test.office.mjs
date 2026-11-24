@@ -18,29 +18,43 @@ const db = {
     { chat_id: '100', email: 'new@demo.test', user_id: null, name: '', role: 'employee', status: 'invited' },
   ],
   office_activity: [],
+  tenant_users: [{ user_id: U(1), chat_id: '100' }],
 };
+db.office_members.forEach((m, i) => { m.id = i + 1; });
+let memberId = db.office_members.length + 1;
+const registered = new Set(['already@demo.test']); // logins that already exist
+const invites = [];
 let nextId = 1;
 const calls = [];
+const matches = (u) => (r) => {
+  for (const [k, v] of u.searchParams) {
+    if (['select', 'limit', 'order', 'redirect_to'].includes(k)) continue;
+    const [op, ...rest] = v.split('.'); const val = rest.join('.'); const x = r[k];
+    if (op === 'eq' && String(x) !== val) return false;
+    if (op === 'neq' && String(x) === val) return false;
+    if (op === 'lt' && !(Number(x) < Number(val))) return false;
+    if (op === 'gte' && !(String(x) >= val)) return false;
+  }
+  return true;
+};
 const fakeFetch = async (url, opt = {}) => {
   const u = new URL(url); const table = u.pathname.split('/').pop();
-  calls.push({ method: opt.method || 'GET', table, search: decodeURIComponent(u.search), body: opt.body });
-  if (opt.method === 'POST') { const row = JSON.parse(opt.body); db[table].push({ id: nextId++, ts: new Date().toISOString(), ...row }); return new Response('', { status: 201 }); }
-  let rows = [...db[table]];
-  let limit = Infinity, order = null;
-  for (const [k, v] of u.searchParams) {
-    if (k === 'select') continue;
-    if (k === 'limit') { limit = Number(v); continue; }
-    if (k === 'order') { order = v; continue; }
-    const [op, ...rest] = v.split('.'); const val = rest.join('.');
-    rows = rows.filter((r) => {
-      const x = r[k];
-      if (op === 'eq') return String(x) === val;
-      if (op === 'neq') return String(x) !== val;
-      if (op === 'lt') return Number(x) < Number(val);
-      if (op === 'gte') return String(x) >= val;
-      return true;
-    });
+  calls.push({ method: opt.method || 'GET', table, search: decodeURIComponent(u.search), body: opt.body, headers: opt.headers });
+  if (u.pathname === '/auth/v1/invite') {
+    const b = JSON.parse(opt.body); invites.push({ email: b.email, redirect: u.searchParams.get('redirect_to'), data: b.data, auth: opt.headers });
+    if (registered.has(b.email)) return new Response('{"msg":"A user with this email address has already been registered"}', { status: 422 });
+    return new Response('{}', { status: 200 });
   }
+  if (opt.method === 'POST') {
+    const row = JSON.parse(opt.body);
+    if (table === 'office_members') { if (db.office_members.some((m) => m.email === row.email)) return new Response('', { status: 409 }); db.office_members.push({ id: memberId++, user_id: null, ...row }); return new Response('', { status: 201 }); }
+    if (table === 'tenant_users') { if (!db.tenant_users.some((t) => t.user_id === row.user_id)) db.tenant_users.push(row); return new Response('', { status: 201 }); }
+    db[table].push({ id: nextId++, ts: new Date().toISOString(), ...row }); return new Response('', { status: 201 });
+  }
+  if (opt.method === 'PATCH') { const ch = JSON.parse(opt.body); db[table].filter(matches(u)).forEach((r) => Object.assign(r, ch)); return new Response(null, { status: 204 }); }
+  if (opt.method === 'DELETE') { db[table] = db[table].filter((r) => !matches(u)(r)); return new Response(null, { status: 204 }); }
+  let rows = db[table].filter(matches(u));
+  const limit = Number(u.searchParams.get('limit')) || Infinity, order = u.searchParams.get('order');
   if (order === 'id.desc') rows.sort((a, b) => b.id - a.id);
   return new Response(JSON.stringify(rows.slice(0, limit)), { status: 200 });
 };
@@ -91,14 +105,48 @@ check('summary: who did the most (owner only) and where', sum.people[0].email ==
 check('summary: employees don\'t get the team breakdown', (await office.summary(emp)).people.length === 0);
 check('summary: an employee gets their own numbers', (await office.summary(emp)).tasks === 3);
 const team = await office.team(owner);
-check('team: owner sees the people (not removed ones), invited ones marked', team.people.length === 3 && team.people.some((p) => p.email === 'new@demo.test' && p.status === 'invited') && !team.people.some((p) => p.email === 'gone@demo.test'), team);
+check('team: owner sees the people (not removed ones), invited ones marked', team.people.length === 3 && team.people.every((p) => p.memberId) && team.people.some((p) => p.email === 'new@demo.test' && p.status === 'invited') && !team.people.some((p) => p.email === 'gone@demo.test'), team);
 check('team: employees don\'t get the team list', (await office.team(emp)).people.length === 0);
 check('business name and color', JSON.stringify(await office.business('100')) === JSON.stringify({ name: 'Demo Office', accent: '#3b5bdb' }));
 
+// ---- Team: invite, join, remove
+const inv = await office.invite(owner, { email: '  New.Hire@Demo.TEST ', name: 'Nia Park' }, { redirectTo: 'https://www.co-optech.com/office/', office: 'Demo Office' });
+const nia = db.office_members.find((m) => m.email === 'new.hire@demo.test');
+check('invite: added as invited, email tidied, invite email sent with the link back to the office', inv.ok && inv.sent && nia?.status === 'invited' && nia.chat_id === '100' && nia.name === 'Nia Park' && invites.at(-1).email === 'new.hire@demo.test' && invites.at(-1).redirect === 'https://www.co-optech.com/office/' && invites.at(-1).data.office === 'Demo Office', { inv, nia, last: invites.at(-1) });
+check('invite: the sign-in service is called with the server key, never a person\'s token', invites.at(-1).auth.apikey === 'sb_secret_x');
+check('invite: one email, one office (another office\'s person can\'t be added)', (await office.invite(owner, { email: 'boss@other.test' })).error === 'taken');
+check('invite: someone already on the team', (await office.invite(owner, { email: 'emp@demo.test' })).error === 'already_member');
+check('invite: only the owner can invite', (await office.invite(emp, { email: 'x@demo.test' })).error === 'owner_only');
+check('invite: not an email', (await office.invite(owner, { email: 'not an email' })).error === 'bad_email' && (await office.invite(owner, { email: 'a@b' })).error === 'bad_email');
+const ex = await office.invite(owner, { email: 'already@demo.test' });
+check('invite: a person who already has a login just signs in (no email needed)', ex.ok && ex.existing === true && ex.sent === false);
+const before2 = invites.length;
+check('resend: only for people still invited', (await office.resend(owner, nia.id)).sent === true && invites.length === before2 + 1 && (await office.resend(owner, 2)).error === 'not_found' && (await office.resend(emp, nia.id)).error === 'owner_only');
+// first sign-in
+const NIA = U(7);
+check('join: an unconfirmed email can\'t claim an invite', (await office.claim(NIA, 'new.hire@demo.test', false)).ok === false && !nia.user_id);
+check('join: a different email can\'t claim it', (await office.claim(NIA, 'someone@else.test', true)).ok === false);
+const cl = await office.claim(NIA, 'New.Hire@demo.test', true);
+check('join: their confirmed email claims the invite: active, linked to the office (extension works too)', cl.ok && nia.user_id === NIA && nia.status === 'active' && nia.joined_at && db.tenant_users.some((t) => t.user_id === NIA && t.chat_id === '100'), { nia, tu: db.tenant_users });
+check('join: now they\'re a member (employee)', (await office.member(NIA)).role === 'employee');
+check('join: nobody else can claim it after', (await office.claim(U(8), 'new.hire@demo.test', true)).ok === false && nia.user_id === NIA);
+check('join: never overwrites an existing extension link', (await office.claim(U(1), 'owner@demo.test', true)) && db.tenant_users.filter((t) => t.user_id === U(1)).length === 1);
+// remove
+check('remove: the owner can\'t be removed', (await office.remove(owner, 1)).error === 'cant_remove_owner');
+check('remove: only the owner can remove', (await office.remove(emp, nia.id)).error === 'owner_only');
+check('remove: another office\'s person can\'t be removed from here', (await office.remove(owner, 3)).error === 'not_found');
+const rm = await office.remove(owner, nia.id);
+check('remove: cut off at once: removed, extension link gone, no longer a member', rm.ok && nia.status === 'removed' && !db.tenant_users.some((t) => t.user_id === NIA) && (await office.member(NIA)).error === 'not_member', { nia, tu: db.tenant_users });
+check('remove: a removed person can\'t sign back in to claim it', (await office.claim(NIA, 'new.hire@demo.test', true)).ok === false);
+const back = await office.invite(owner, { email: 'new.hire@demo.test' });
+check('re-invite: a removed person can be invited again (fresh, unlinked)', back.ok && nia.status === 'invited' && nia.user_id === null);
+
 // ---- the /web/office doors
 const app = express();
-const tokens = { 'tok-owner-123456': U(1), 'tok-emp-1234567': U(2), 'tok-other-123456': U(3), 'tok-gone-1234567': U(4), 'tok-stranger-12': U(9) };
-const auth = { verify: async (t) => (tokens[t] ? { userId: tokens[t] } : { error: 'unauthorized' }), chatFor: async () => ({ error: 'unlinked' }) };
+const tokens = { 'tok-owner-123456': U(1), 'tok-emp-1234567': U(2), 'tok-other-123456': U(3), 'tok-gone-1234567': U(4), 'tok-stranger-12': U(9), 'tok-nia-12345678': NIA };
+const emails = { [NIA]: 'new.hire@demo.test' };
+const forgotten = [];
+const auth = { verify: async (t) => (tokens[t] ? { userId: tokens[t], email: emails[tokens[t]] || '', emailConfirmed: true } : { error: 'unauthorized' }), chatFor: async () => ({ error: 'unlinked' }), forgetLink: (id) => forgotten.push(id) };
 mountWebApi(app, { express, auth, getTenant: () => null, ops: {}, office, siteOrigin: 'https://co-optech.com' });
 const srv = app.listen(0); const port = srv.address().port;
 const get = async (path, tok, origin = 'https://co-optech.com') => {
@@ -117,8 +165,20 @@ const oa = await get(`/office/activity?person=${U(2)}`, 'tok-owner-123456');
 check('door: owner can filter by person', oa.body.rows.length === 3);
 check('door: other business sees only theirs', (await get('/office/activity', 'tok-other-123456')).body.rows.map((r) => r.request).join() === 'OTHER BUSINESS SECRET');
 check('door: summary works', (await get('/office/summary', 'tok-owner-123456')).body.tasks === 4);
-check('door: team list for the owner only', (await get('/office/team', 'tok-owner-123456')).body.people.length === 3 && (await get('/office/team', 'tok-emp-1234567')).body.people.length === 0);
+check('door: team list for the owner only', (await get('/office/team', 'tok-owner-123456')).body.people.length >= 3 && (await get('/office/team', 'tok-emp-1234567')).body.people.length === 0);
 check('door: other websites can\'t call it', (await get('/office/me', 'tok-owner-123456', 'https://evil.test')).status === 403);
+check('door: an invited person\'s first sign-in links them and lets them in', (await get('/office/me', 'tok-nia-12345678')).body?.role === 'employee' && nia.status === 'active');
+const post = async (path, tok, body, origin = 'https://co-optech.com') => {
+  const r = await fetch(`http://127.0.0.1:${port}/web${path}`, { method: 'POST', headers: { 'content-type': 'application/json', origin, ...(tok ? { authorization: `Bearer ${tok}` } : {}) }, body: JSON.stringify(body) });
+  let b = null; try { b = await r.json(); } catch { /* */ } return { status: r.status, body: b };
+};
+const pi = await post('/office/team/invite', 'tok-owner-123456', { email: 'second@demo.test', name: 'Sam Two' });
+check('door: owner invites, gets a plain note', pi.status === 200 && pi.body.sent && /Invite sent/.test(pi.body.note) && invites.at(-1).redirect === 'https://co-optech.com/office/', pi);
+check('door: employees can\'t invite', (await post('/office/team/invite', 'tok-emp-1234567', { email: 'z@demo.test' })).status === 403);
+check('door: another office\'s email: a plain message', /another office/.test((await post('/office/team/invite', 'tok-owner-123456', { email: 'boss@other.test' })).body.message));
+const pr = await post('/office/team/remove', 'tok-owner-123456', { memberId: nia.id });
+check('door: owner removes, and the extension link is forgotten right away', pr.status === 200 && forgotten.includes(NIA) && (await get('/office/me', 'tok-nia-12345678')).status === 403);
+check('door: other websites can\'t change the team', (await post('/office/team/invite', 'tok-owner-123456', { email: 'q@demo.test' }, 'https://evil.test')).status === 403);
 srv.close();
 
 console.log(`\n${pass} passed, ${fail} failed`);

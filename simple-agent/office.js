@@ -125,9 +125,100 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
   async function team(m) {
     if (!enabled || !m?.chatId) return { error: 'unavailable' };
     if (m.role !== 'owner') return { people: [] };
-    const r = await rest(`office_members?chat_id=eq.${m.chatId}&status=neq.removed&select=user_id,email,name,role,status&order=role.desc,email.asc`);
-    return r.ok ? { people: r.rows.map((p) => ({ id: p.user_id || null, email: String(p.email), name: p.name || '', role: p.role, status: p.status })) } : { error: 'unavailable' };
+    const r = await rest(`office_members?chat_id=eq.${m.chatId}&status=neq.removed&select=id,user_id,email,name,role,status,invited_at,joined_at&order=role.desc,email.asc`);
+    return r.ok ? { people: r.rows.map((p) => ({ id: p.user_id || null, memberId: p.id, email: String(p.email), name: p.name || '', role: p.role, status: p.status, invitedAt: p.invited_at, joinedAt: p.joined_at })) } : { error: 'unavailable' };
   }
 
-  return { enabled, member, forget, business, logTask, activity, summary, team };
+  // ---- Team: the owner adds people by email. Each email belongs to ONE office. The person gets an email from
+  //      the sign-in service, follows it and sets their OWN password (the owner never sees or sets it).
+  const EMAIL_RE = /^[^\s@<>()"',;]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+  const cleanEmail = (e) => String(e ?? '').trim().toLowerCase();
+  async function byEmail(email) {
+    const r = await rest(`office_members?email=eq.${encodeURIComponent(email)}&select=id,chat_id,user_id,role,status&limit=1`);
+    return r.ok ? { row: r.rows[0] || null } : { error: 'unavailable' };
+  }
+  // ask the sign-in service to email them a "join your office" link
+  async function sendInvite(email, { redirectTo, office: officeName } = {}) {
+    const q = redirectTo ? `?redirect_to=${encodeURIComponent(redirectTo)}` : '';
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetchImpl(`${base}/auth/v1/invite${q}`, { method: 'POST', headers, body: JSON.stringify({ email, data: { office: officeName || '' } }), signal: ctl.signal });
+      if (res.ok) return { sent: true };
+      let body = ''; try { body = await res.text(); } catch { /* ignore */ }
+      if (res.status === 422 || /already been registered|already registered|email_exists/i.test(body)) return { sent: false, existing: true }; // they already have a login: they just sign in
+      if (res.status === 429 || /rate limit/i.test(body)) return { sent: false, emailError: 'rate_limited' };
+      return { sent: false, emailError: 'email_failed' };
+    } catch { return { sent: false, emailError: 'email_failed' }; } finally { clearTimeout(t); }
+  }
+
+  async function invite(m, { email, name } = {}, opts = {}) {
+    if (!enabled || !m?.chatId) return { error: 'unavailable' };
+    if (m.role !== 'owner') return { error: 'owner_only' };
+    const e = cleanEmail(email);
+    if (!EMAIL_RE.test(e) || e.length > 254) return { error: 'bad_email' };
+    const nm = tidy(name, 80) || null;
+    const found = await byEmail(e);
+    if (found.error) return found;
+    const row = found.row;
+    if (row && String(row.chat_id) !== m.chatId) return { error: 'taken' }; // one email, one office
+    if (row && row.status === 'active') return { error: 'already_member' };
+    let r;
+    if (row) r = await rest(`office_members?id=eq.${row.id}`, { method: 'PATCH', body: { status: 'invited', role: 'employee', ...(nm ? { name: nm } : {}), invited_at: new Date(now()).toISOString(), joined_at: null, user_id: null }, prefer: 'return=minimal' });
+    else r = await rest('office_members', { method: 'POST', body: { chat_id: m.chatId, email: e, name: nm, role: 'employee', status: 'invited' }, prefer: 'return=minimal' });
+    if (!r.ok) return { error: r.status === 409 ? 'taken' : 'unavailable' };
+    const sent = await sendInvite(e, opts);
+    return { ok: true, email: e, ...sent };
+  }
+
+  async function resend(m, memberId, opts = {}) {
+    if (!enabled || !m?.chatId) return { error: 'unavailable' };
+    if (m.role !== 'owner') return { error: 'owner_only' };
+    if (!/^\d{1,18}$/.test(String(memberId))) return { error: 'not_found' };
+    const r = await rest(`office_members?id=eq.${memberId}&chat_id=eq.${m.chatId}&status=eq.invited&select=email&limit=1`);
+    if (!r.ok) return { error: 'unavailable' };
+    if (!r.rows[0]) return { error: 'not_found' };
+    await rest(`office_members?id=eq.${memberId}&chat_id=eq.${m.chatId}`, { method: 'PATCH', body: { invited_at: new Date(now()).toISOString() }, prefer: 'return=minimal' });
+    return { ok: true, email: r.rows[0].email, ...(await sendInvite(String(r.rows[0].email), opts)) };
+  }
+
+  // Removing someone cuts them off at once: the dashboard, and the Agent extension (its link to the office).
+  async function remove(m, memberId) {
+    if (!enabled || !m?.chatId) return { error: 'unavailable' };
+    if (m.role !== 'owner') return { error: 'owner_only' };
+    if (!/^\d{1,18}$/.test(String(memberId))) return { error: 'not_found' };
+    const r = await rest(`office_members?id=eq.${memberId}&chat_id=eq.${m.chatId}&select=id,user_id,role,status&limit=1`);
+    if (!r.ok) return { error: 'unavailable' };
+    const row = r.rows[0];
+    if (!row || row.status === 'removed') return { error: 'not_found' };
+    if (row.role === 'owner') return { error: 'cant_remove_owner' };
+    const up = await rest(`office_members?id=eq.${memberId}&chat_id=eq.${m.chatId}`, { method: 'PATCH', body: { status: 'removed' }, prefer: 'return=minimal' });
+    if (!up.ok) return { error: 'unavailable' };
+    if (row.user_id) {
+      await rest(`tenant_users?user_id=eq.${row.user_id}&chat_id=eq.${m.chatId}`, { method: 'DELETE', prefer: 'return=minimal' });
+      forget(row.user_id);
+    }
+    return { ok: true, userId: row.user_id || null };
+  }
+
+  // First sign-in after an invite: match the login to the invite by its CONFIRMED email, mark them active, and
+  // link the login to the office so the Agent extension works for them too.
+  async function claim(userId, email, emailConfirmed) {
+    if (!enabled || !UUID_RE.test(String(userId))) return { ok: false };
+    const e = cleanEmail(email);
+    if (!emailConfirmed || !EMAIL_RE.test(e)) return { ok: false };
+    const found = await byEmail(e);
+    const row = found.row;
+    if (!row || row.status === 'removed' || (row.user_id && row.user_id !== userId)) return { ok: false };
+    if (!CHAT_RE.test(String(row.chat_id))) return { ok: false };
+    if (!row.user_id || row.status !== 'active') {
+      const up = await rest(`office_members?id=eq.${row.id}&status=neq.removed`, { method: 'PATCH', body: { user_id: userId, status: 'active', joined_at: new Date(now()).toISOString() }, prefer: 'return=minimal' });
+      if (!up.ok) return { ok: false };
+    }
+    // the extension's link (never overwrites a link this login already has)
+    await rest('tenant_users', { method: 'POST', body: { user_id: userId, chat_id: String(row.chat_id) }, prefer: 'return=minimal,resolution=ignore-duplicates' });
+    forget(userId);
+    return { ok: true, chatId: String(row.chat_id) };
+  }
+
+  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim };
 }
