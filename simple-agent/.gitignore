@@ -8,3 +8,5 @@ node_modules/
 *.tgz
 data/
 workspaces/
+agent-extension/
+dashboard/
