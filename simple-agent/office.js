@@ -237,5 +237,16 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     return { ok: true, chatId: String(row.chat_id) };
   }
 
-  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim };
+  // ---- Account: a person changes the name shown for them (their own row only)
+  async function rename(m, name) {
+    if (!enabled || !m?.chatId || !UUID_RE.test(String(m.userId))) return { error: 'unavailable' };
+    const nm = tidy(name, 80);
+    if (!nm) return { error: 'bad_name' };
+    const r = await rest(`office_members?user_id=eq.${m.userId}&chat_id=eq.${m.chatId}&status=eq.active`, { method: 'PATCH', body: { name: nm }, prefer: 'return=minimal' });
+    if (!r.ok) return { error: 'unavailable' };
+    forget(m.userId);
+    return { ok: true, name: nm };
+  }
+
+  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim, rename };
 }

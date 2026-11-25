@@ -126,6 +126,12 @@ const ex = await office.invite(owner, { email: 'already@demo.test' }, { redirect
 check('invite: someone who already has a login gets a "set your password" link instead', ex.ok && ex.existing === true && ex.sent === true && recovers.at(-1)?.email === 'already@demo.test' && recovers.at(-1).redirect === 'https://www.co-optech.com/office/' && recovers.at(-1).auth.apikey === 'sb_secret_x', { ex, r: recovers.at(-1) });
 const exAgain = await office.resend(owner, db.office_members.find((m) => m.email === 'already@demo.test').id, { redirectTo: 'https://www.co-optech.com/office/' });
 check('resend: works again for them (the stuck case)', exAgain.sent === true && recovers.length === 2);
+// ---- Account: rename yourself
+const empRow = db.office_members.find((m) => m.email === 'emp@demo.test');
+const rn = await office.rename({ ...emp, userId: empRow.user_id }, '  Sam\u0007 Ortiz  ');
+check('rename: tidies the name and changes only your own row', rn.ok && rn.name === 'Sam Ortiz' && empRow.name === 'Sam Ortiz' && calls.at(-1).search.includes(`user_id=eq.${empRow.user_id}`) && calls.at(-1).search.includes('chat_id=eq.100'), { rn, empRow, s: calls.at(-1)?.search });
+check('rename: empty name refused', (await office.rename({ ...emp, userId: empRow.user_id }, '   ')).error === 'bad_name');
+check('rename: needs a real login id', (await office.rename({ ...emp, userId: 'x' }, 'A')).error === 'unavailable');
 const before2 = invites.length;
 check('resend: only for people still invited', (await office.resend(owner, nia.id)).sent === true && invites.length === before2 + 1 && (await office.resend(owner, 2)).error === 'not_found' && (await office.resend(emp, nia.id)).error === 'owner_only');
 // first sign-in

@@ -117,10 +117,15 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     }
   };
   const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
-  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove'], cors, (_req, res) => res.status(204).end());
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
     return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name } };
+  }));
+  router.post('/office/me/name', cors, limitIp, json, whoOffice, run(async (req) => {
+    const r = await office.rename(req.member, req.body?.name);
+    if (r.error === 'bad_name') return { status: 400, body: { error: 'bad_name', message: 'Type a name.' } };
+    return r.error ? { status: 503, body: { error: 'try again in a moment' } } : { body: { ok: true, name: r.name } };
   }));
   router.get('/office/activity', cors, limitIp, whoOffice, run(async (req) => {
     const limit = 30;
