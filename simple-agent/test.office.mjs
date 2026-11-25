@@ -23,7 +23,7 @@ const db = {
 db.office_members.forEach((m, i) => { m.id = i + 1; });
 let memberId = db.office_members.length + 1;
 const registered = new Set(['already@demo.test']); // logins that already exist
-const invites = [];
+const invites = [], recovers = [];
 let nextId = 1;
 const calls = [];
 const matches = (u) => (r) => {
@@ -43,6 +43,10 @@ const fakeFetch = async (url, opt = {}) => {
   if (u.pathname === '/auth/v1/invite') {
     const b = JSON.parse(opt.body); invites.push({ email: b.email, redirect: u.searchParams.get('redirect_to'), data: b.data, auth: opt.headers });
     if (registered.has(b.email)) return new Response('{"msg":"A user with this email address has already been registered"}', { status: 422 });
+    return new Response('{}', { status: 200 });
+  }
+  if (u.pathname === '/auth/v1/recover') {
+    const b = JSON.parse(opt.body); recovers.push({ email: b.email, redirect: u.searchParams.get('redirect_to'), auth: opt.headers });
     return new Response('{}', { status: 200 });
   }
   if (opt.method === 'POST') {
@@ -118,8 +122,10 @@ check('invite: one email, one office (another office\'s person can\'t be added)'
 check('invite: someone already on the team', (await office.invite(owner, { email: 'emp@demo.test' })).error === 'already_member');
 check('invite: only the owner can invite', (await office.invite(emp, { email: 'x@demo.test' })).error === 'owner_only');
 check('invite: not an email', (await office.invite(owner, { email: 'not an email' })).error === 'bad_email' && (await office.invite(owner, { email: 'a@b' })).error === 'bad_email');
-const ex = await office.invite(owner, { email: 'already@demo.test' });
-check('invite: a person who already has a login just signs in (no email needed)', ex.ok && ex.existing === true && ex.sent === false);
+const ex = await office.invite(owner, { email: 'already@demo.test' }, { redirectTo: 'https://www.co-optech.com/office/' });
+check('invite: someone who already has a login gets a "set your password" link instead', ex.ok && ex.existing === true && ex.sent === true && recovers.at(-1)?.email === 'already@demo.test' && recovers.at(-1).redirect === 'https://www.co-optech.com/office/' && recovers.at(-1).auth.apikey === 'sb_secret_x', { ex, r: recovers.at(-1) });
+const exAgain = await office.resend(owner, db.office_members.find((m) => m.email === 'already@demo.test').id, { redirectTo: 'https://www.co-optech.com/office/' });
+check('resend: works again for them (the stuck case)', exAgain.sent === true && recovers.length === 2);
 const before2 = invites.length;
 check('resend: only for people still invited', (await office.resend(owner, nia.id)).sent === true && invites.length === before2 + 1 && (await office.resend(owner, 2)).error === 'not_found' && (await office.resend(emp, nia.id)).error === 'owner_only');
 // first sign-in
