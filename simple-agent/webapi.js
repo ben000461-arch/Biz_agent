@@ -51,7 +51,9 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
       if (v.error === 'unauthorized') return res.status(401).json({ error: 'sign in again' });
       if (v.error) return res.status(503).json({ error: 'try again in a moment' });
       if (!userLimit(v.userId)) return res.status(429).json({ error: 'slow down a little' });
-      const link = await auth.chatFor(v.userId);
+      let link = await auth.chatFor(v.userId);
+      // someone an office invited, signing in to the extension before the dashboard: link them now
+      if (link.error === 'unlinked' && office?.enabled && v.email && (await office.claim(v.userId, v.email, v.emailConfirmed)).ok) link = await auth.chatFor(v.userId);
       if (link.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
       const tenant = link.chatId ? getTenant(link.chatId) : null;
       if (!tenant) return res.status(409).json({ error: 'not_linked' });
@@ -102,7 +104,9 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
       if (v.error === 'unauthorized') return res.status(401).json({ error: 'sign in again' });
       if (v.error) return res.status(503).json({ error: 'try again in a moment' });
       if (!userLimit(v.userId)) return res.status(429).json({ error: 'slow down a little' });
-      const member = await office.member(v.userId);
+      let member = await office.member(v.userId);
+      // first sign-in after an invite: match it by their confirmed email, then look again
+      if (member.error === 'not_member' && v.email && (await office.claim(v.userId, v.email, v.emailConfirmed)).ok) member = await office.member(v.userId);
       if (member.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
       if (member.error) return res.status(403).json({ error: 'not_member', message: 'This login isn’t part of an office yet. Ask your office’s owner to add your email.' });
       req.member = { ...member, userId: v.userId };
@@ -113,7 +117,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     }
   };
   const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
-  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team'], cors, (_req, res) => res.status(204).end());
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
     return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name } };
@@ -131,6 +135,40 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   router.get('/office/team', cors, limitIp, whoOffice, run(async (req) => {
     const t = await office.team(req.member);
     return t.error ? { status: 503, body: { error: 'try again in a moment' } } : { body: t };
+  }));
+
+  // ---- Team (owner only): invite by email, send the invite again, remove someone
+  const TEAM_ERR = {
+    owner_only: [403, 'Only the office’s owner can change the team.'],
+    bad_email: [400, 'That doesn’t look like an email address.'],
+    taken: [409, 'That email already belongs to another office. One email can only be in one office.'],
+    already_member: [409, 'That person is already on your team.'],
+    not_found: [404, 'That person isn’t on your team any more.'],
+    cant_remove_owner: [400, 'The owner can’t be removed.'],
+    unavailable: [503, 'Try again in a moment.'],
+  };
+  const teamOut = (r) => {
+    if (r.error) { const [status, message] = TEAM_ERR[r.error] || [503, 'Try again in a moment.']; return { status, body: { error: r.error, message } }; }
+    const note = r.existing && r.sent ? 'They already had a login, so we emailed them a link to set their password.'
+      : r.sent ? 'Invite sent. They’ll get an email to set their password.'
+      : r.emailError === 'rate_limited' ? 'They’re added, but too many emails went out this hour. Use “Send again” in a little while.'
+      : r.sent === false ? 'They’re added, but the invite email couldn’t be sent. Check the email settings in Supabase, then use “Send again”.' : '';
+    return { body: { ok: true, sent: r.sent === true, existing: r.existing === true, emailProblem: r.sent === false, note } };
+  };
+  const inviteOpts = { redirectTo: siteOrigin ? `${siteOrigin}/office/` : undefined };
+  router.post('/office/team/invite', cors, limitIp, json, whoOffice, run(async (req) => {
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const biz = await office.business(req.member.chatId);
+    return teamOut(await office.invite(req.member, { email: b.email, name: b.name }, { ...inviteOpts, office: biz?.name }));
+  }));
+  router.post('/office/team/resend', cors, limitIp, json, whoOffice, run(async (req) => {
+    const biz = await office.business(req.member.chatId);
+    return teamOut(await office.resend(req.member, String(req.body?.memberId ?? ''), { ...inviteOpts, office: biz?.name }));
+  }));
+  router.post('/office/team/remove', cors, limitIp, json, whoOffice, run(async (req) => {
+    const r = await office.remove(req.member, String(req.body?.memberId ?? ''));
+    if (r.ok && r.userId) auth.forgetLink?.(r.userId); // cut the extension off right away too
+    return r.error ? teamOut(r) : { body: { ok: true } };
   }));
   router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
   router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));

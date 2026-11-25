@@ -38,7 +38,7 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return { error: 'unauthorized' };
     const h = crypto.createHash('sha256').update(token).digest('hex');
     const hit = tokens.get(h);
-    if (hit && hit.until > now()) return { userId: hit.userId };
+    if (hit && hit.until > now()) return { userId: hit.userId, email: hit.email, emailConfirmed: hit.emailConfirmed };
     let res;
     try {
       res = await withTimeout(`${base}/auth/v1/user`, { method: 'GET', headers: { apikey: secret, authorization: `Bearer ${token}` } });
@@ -48,9 +48,12 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     let u;
     try { u = await res.json(); } catch { return { error: 'unavailable' }; }
     if (!u || typeof u.id !== 'string' || !UUID_RE.test(u.id)) return { error: 'unauthorized' };
-    tokens.set(h, { userId: u.id, until: now() + tokenTtlMs });
+    // the email comes with it: an office invite is matched to the person by their (confirmed) email
+    const email = typeof u.email === 'string' ? u.email.trim().toLowerCase().slice(0, 254) : '';
+    const emailConfirmed = Boolean(u.email_confirmed_at || u.confirmed_at);
+    tokens.set(h, { userId: u.id, email, emailConfirmed, until: now() + tokenTtlMs });
     prune(tokens);
-    return { userId: u.id };
+    return { userId: u.id, email, emailConfirmed };
   }
 
   // -> { chatId } | { error: 'unlinked' | 'unavailable' }
@@ -102,7 +105,9 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     } catch { return []; }
   }
 
-  return { verify, chatFor, saveMessages, loadMessages, enabled };
+  // forget a cached link right away (e.g. someone was just removed from an office)
+  const forgetLink = (userId) => links.delete(userId);
+  return { verify, chatFor, forgetLink, saveMessages, loadMessages, enabled };
 }
 
 // A tiny sliding-window counter: allow(key) -> true while under `max` hits in the last `windowMs`.
