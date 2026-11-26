@@ -44,17 +44,22 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   const limitIp = (req, res, next) => (ipLimit(req.ip || 'x') ? next() : res.status(429).json({ error: 'too many requests' }));
 
   // who is asking? -> sets req.tenant, or answers 401 / 503 / 409 itself
-  const who = async (req, res, next) => {
+  // `who` is for the owner's own agent (schedule, agents, connections, account). `whoAgent` is for the
+  // Agent extension's two doors, which an office's employees may use too.
+  const who = (req, res, next) => gate(req, res, next, false);
+  const whoAgent = (req, res, next) => gate(req, res, next, true);
+  const gate = async (req, res, next, agent) => {
     try {
       const m = /^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '');
       const v = await auth.verify(m ? m[1] : '');
       if (v.error === 'unauthorized') return res.status(401).json({ error: 'sign in again' });
       if (v.error) return res.status(503).json({ error: 'try again in a moment' });
       if (!userLimit(v.userId)) return res.status(429).json({ error: 'slow down a little' });
-      let link = await auth.chatFor(v.userId);
+      let link = await auth.chatFor(v.userId, { agent });
       // someone an office invited, signing in to the extension before the dashboard: link them now
-      if (link.error === 'unlinked' && office?.enabled && v.email && (await office.claim(v.userId, v.email, v.emailConfirmed)).ok) link = await auth.chatFor(v.userId);
+      if (link.error === 'unlinked' && agent && office?.enabled && v.email && (await office.claim(v.userId, v.email, v.emailConfirmed)).ok) link = await auth.chatFor(v.userId, { agent });
       if (link.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
+      if (link.error === 'employee') return res.status(403).json({ error: 'owner_only', message: 'This part belongs to your office’s owner.' });
       const tenant = link.chatId ? getTenant(link.chatId) : null;
       if (!tenant) return res.status(409).json({ error: 'not_linked' });
       req.tenant = tenant;
@@ -91,8 +96,8 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   const bigJson = express.json({ limit: '256kb' }); // a page snapshot is bigger than a normal request
   const planJson = express.json({ limit: '2mb' }); // ...and a plan may also carry one screenshot
   router.options(['/agent/plan', '/agent/log'], corsAgent, (_req, res) => res.status(204).end());
-  router.post('/agent/plan', corsAgent, limitIp, planJson, who, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
-  router.post('/agent/log', corsAgent, limitIp, bigJson, who, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId)));
+  router.post('/agent/plan', corsAgent, limitIp, planJson, whoAgent, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
+  router.post('/agent/log', corsAgent, limitIp, bigJson, whoAgent, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId)));
 
   // ---- the Office dashboard (owner / employee). Signed in with the same login; reads only that person's
   //      business, and only their own work unless they're the owner.

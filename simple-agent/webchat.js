@@ -56,23 +56,44 @@ export function createWebAuth({ url, key, fetchImpl = globalThis.fetch, timeoutM
     return { userId: u.id, email, emailConfirmed };
   }
 
-  // -> { chatId } | { error: 'unlinked' | 'unavailable' }
-  async function chatFor(userId) {
+  // -> { chatId } | { error: 'unlinked' | 'employee' | 'unavailable' }
+  //
+  // An office's EMPLOYEES are linked to the owner's business too (so the Agent extension works for them),
+  // but that must not hand them the owner's agent: chat, calendar, connections, billing, account. So they
+  // only get the business back when the caller says it's an Agent-extension door ({ agent: true });
+  // everywhere else they look unlinked. If we can't tell who someone is, we say "unavailable" (fail closed).
+  async function chatFor(userId, { agent = false } = {}) {
     if (!enabled) return { error: 'unavailable' };
     if (!UUID_RE.test(String(userId))) return { error: 'unlinked' };
-    const hit = links.get(userId);
-    if (hit && hit.until > now()) return { chatId: hit.chatId };
-    let rows;
-    try {
-      const res = await withTimeout(`${base}/rest/v1/tenant_users?user_id=eq.${userId}&select=chat_id&limit=1`, { method: 'GET', headers: restHeaders() });
-      if (!res.ok) return { error: 'unavailable' };
-      rows = await res.json();
-    } catch { return { error: 'unavailable' }; }
-    const chatId = Array.isArray(rows) && rows[0] ? String(rows[0].chat_id ?? '') : '';
-    if (!/^-?\d{1,20}$/.test(chatId)) return { error: 'unlinked' };
-    links.set(userId, { chatId, until: now() + linkTtlMs });
-    prune(links);
-    return { chatId };
+    let hit = links.get(userId);
+    if (!hit || hit.until <= now()) {
+      let rows, roles;
+      try {
+        const [res, r2] = await Promise.all([
+          withTimeout(`${base}/rest/v1/tenant_users?user_id=eq.${userId}&select=chat_id&limit=1`, { method: 'GET', headers: restHeaders() }),
+          withTimeout(`${base}/rest/v1/office_members?user_id=eq.${userId}&status=eq.active&select=role,chat_id`, { method: 'GET', headers: restHeaders() }),
+        ]);
+        if (!res.ok) return { error: 'unavailable' };
+        rows = await res.json();
+        if (r2.ok) roles = await r2.json();
+        else {
+          // no office tables at all (a setup without Office) means nobody is an employee; any other failure: stop
+          const body = await r2.text().catch(() => '');
+          if (!(r2.status === 404 || /PGRST205|42P01|does not exist|Could not find the table/i.test(body))) return { error: 'unavailable' };
+          roles = [];
+        }
+      } catch { return { error: 'unavailable' }; }
+      const chatId = Array.isArray(rows) && rows[0] ? String(rows[0].chat_id ?? '') : '';
+      if (!/^-?\d{1,20}$/.test(chatId)) return { error: 'unlinked' };
+      // an employee of the office this login is linked to (an owner row for the same business wins)
+      const mine = Array.isArray(roles) ? roles.filter((r) => String(r?.chat_id) === chatId) : [];
+      const employee = mine.length > 0 && !mine.some((r) => r?.role === 'owner');
+      hit = { chatId, employee, until: now() + linkTtlMs };
+      links.set(userId, hit);
+      prune(links);
+    }
+    if (hit.employee && !agent) return { error: 'employee' };
+    return { chatId: hit.chatId, employee: hit.employee };
   }
 
   // Save user + assistant messages to Supabase (fire-and-forget, never blocks the response)
