@@ -20,7 +20,7 @@ import { createLimiter } from './webchat.js';
 const ID_RE = /^a[0-9a-f]{4,12}$/;
 const VERBS = new Set(['run', 'pause', 'resume', 'delete', 'schedule', 'update']);
 
-export function mountWebApi(app, { express, auth, getTenant, ops, office = null, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {}, onError = () => {} }) {
+export function mountWebApi(app, { express, auth, getTenant, ops, office = null, knowledge = null, siteOrigin, extraOrigins = [], perUserPerMinute = 60, perIpPerMinute = 180, log = () => {}, onError = () => {} }) {
   const allowed = new Set([siteOrigin, ...extraOrigins].filter(Boolean));
   const userLimit = createLimiter({ max: perUserPerMinute });
   const ipLimit = createLimiter({ max: perIpPerMinute });
@@ -127,12 +127,13 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     }
   };
   const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
-  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name'], cors, (_req, res) => res.status(204).end());
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name', '/office/knowledge', '/office/knowledge/item', '/office/knowledge/file', '/office/knowledge/note', '/office/knowledge/upload', '/office/knowledge/review', '/office/knowledge/remove'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
     // only an owner whose business also signed up for Agent gets the link over to the Agent dashboard
     const hasAgent = req.member.role === 'owner' ? await office.hasAgent(req.member.chatId) : false;
-    return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name, hasAgent } };
+    const pending = req.member.role === 'owner' && knowledge?.enabled ? await knowledge.pendingCount(req.member.chatId) : 0;
+    return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name, hasAgent, pending } };
   }));
   router.post('/office/me/name', cors, limitIp, json, whoOffice, run(async (req) => {
     const r = await office.rename(req.member, req.body?.name);
@@ -187,6 +188,66 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     if (r.ok && r.userId) auth.forgetLink?.(r.userId); // cut the extension off right away too
     return r.error ? teamOut(r) : { body: { ok: true } };
   }));
+  // ---- Knowledge: notes and files for Agent. Employees' wait for the owner's approval (knowledge.js).
+  const KN_ERR = {
+    no_title: [400, 'Give it a short title.'], no_text: [400, 'Type the note.'], too_long: [400, 'That note is too long. Keep it under 5,000 characters.'],
+    too_many_waiting: [429, 'You have 25 things waiting for approval. Ask your owner to review them first.'], full: [409, 'Your office has reached 1,000 items. Remove some old ones first.'],
+    owner_only: [403, 'Only your office’s owner can do that.'], not_found: [404, 'That item isn’t there anymore.'], already_reviewed: [409, 'That was already reviewed.'],
+    bad_decision: [400, 'Choose approve or reject.'], unavailable: [503, 'Couldn’t do that right now. Try again in a moment.'],
+  };
+  const knOut = (r) => {
+    if (!r.error) return null;
+    if (r.message) return { status: 400, body: { error: r.error, message: r.message } }; // from reading the file
+    const [status, message] = KN_ERR[r.error] || [500, 'Something went wrong.'];
+    return { status, body: { error: r.error, message } };
+  };
+  const needKn = (req, res, next) => (knowledge?.enabled ? next() : res.status(503).json({ error: 'try again in a moment' }));
+  const knId = (v) => String(v ?? '').slice(0, 40);
+  router.get('/office/knowledge', cors, limitIp, needKn, whoOffice, run(async (req) => {
+    const r = await knowledge.list(req.member);
+    return knOut(r) || { body: { items: r.items, excel: knowledge.excel } };
+  }));
+  router.get('/office/knowledge/item', cors, limitIp, needKn, whoOffice, run(async (req) => {
+    const r = await knowledge.read(req.member, knId(req.query.id));
+    return knOut(r) || { body: { item: r.item } };
+  }));
+  router.post('/office/knowledge/note', cors, limitIp, needKn, json, whoOffice, run(async (req) => {
+    const r = await knowledge.addNote(req.member, { title: req.body?.title, text: req.body?.text });
+    return knOut(r) || { body: { ok: true, id: r.id, status: r.status } };
+  }));
+  // The file is the request body as-is (up to 10 MB), read only AFTER the sign-in check so strangers can't
+  // make us hold big uploads. The name and title ride in the address.
+  const rawFile = express.raw({ type: () => true, limit: '10mb' });
+  router.post('/office/knowledge/upload', cors, limitIp, needKn, whoOffice, (req, res, next) => rawFile(req, res, (err) => {
+    if (err) return res.status(err.status === 413 ? 413 : 400).json({ error: 'too_big', message: err.status === 413 ? 'That file is over 10 MB.' : 'Couldn’t read that upload.' });
+    next();
+  }), run(async (req) => {
+    const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const r = await knowledge.addFile(req.member, { name: String(req.query.name || ''), title: String(req.query.title || ''), buf });
+    return knOut(r) || { body: { ok: true, id: r.id, status: r.status } };
+  }));
+  router.post('/office/knowledge/review', cors, limitIp, needKn, json, whoOffice, run(async (req) => {
+    const r = await knowledge.review(req.member, knId(req.body?.id), String(req.body?.decision || ''), req.body?.note);
+    return knOut(r) || { body: { ok: true, status: r.status } };
+  }));
+  router.post('/office/knowledge/remove', cors, limitIp, needKn, json, whoOffice, run(async (req) => {
+    const r = await knowledge.remove(req.member, knId(req.body?.id));
+    return knOut(r) || { body: { ok: true } };
+  }));
+  // The original file: always a download (never shown in the browser), with a safe name.
+  router.get('/office/knowledge/file', cors, limitIp, needKn, whoOffice, async (req, res) => {
+    try {
+      const r = await knowledge.download(req.member, knId(req.query.id));
+      if (r.error) { const o = knOut(r); return res.status(o.status).json(o.body); }
+      const ascii = r.name.replace(/[^A-Za-z0-9._ -]/g, '_');
+      res.set({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(r.name)}`, 'Content-Security-Policy': "default-src 'none'; sandbox" });
+      res.status(200).send(r.buf);
+    } catch (err) {
+      try { onError('knowledge download', err); } catch { /* ignore */ }
+      res.status(500).json({ error: 'something went wrong' });
+    }
+  });
+
   router.get('/connections', cors, limitIp, who, run((req) => ops.connections(req.tenant)));
   router.post('/disconnect', cors, limitIp, json, who, run((req) => ops.disconnect(req.tenant, String(req.body?.provider || ''))));
   router.post('/account/delete', cors, limitIp, json, who, run((req) => ops.deleteAccount(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));

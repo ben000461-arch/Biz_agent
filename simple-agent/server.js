@@ -54,6 +54,7 @@ import { parseWhen, parseDuration, deriveTitle, looksLikeBooking, formatWhen, tz
 import * as agentKit from './agents.js';
 import { mountWebApi } from './webapi.js';
 import { createOffice } from './office.js';
+import { createKnowledge } from './knowledge.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2517,6 +2518,8 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 // Only the website's own address may call it (SITE_URL, plus WEB_ORIGINS if you list more, comma-separated).
 const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const office = createOffice({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY }); // the Office dashboard's data (supabase/office.sql)
+// notes and files a business gives its Agent; only owner-approved ones reach the AI (supabase/office_knowledge.sql)
+const knowledge = createKnowledge({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY, xlsx: XLSX });
 mountBilling(app, { auth: webAuth, entitlements, getTenant: (chatId) => store.get(chatId), supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, log: console.log, notify: (text) => (ADMIN_ID ? sendTelegramMessage(ADMIN_ID, '💳 ' + text) : null) });
 const toolReq = mountToolRequests(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, adminId: ADMIN_ID, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), describeChat: (chatId) => store.get(chatId)?.name || store.get(chatId)?.business || '', log: console.log });
 const toolConn = mountToolConn(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), log: console.log });
@@ -2572,7 +2575,9 @@ const webOps = {
     const ctx = { tenant, ent };
     const round = Math.max(1, Math.min(MAX_ROUNDS, Number.parseInt(b.round, 10) || 1));
     const history = cleanHistory(b.history);
-    const extra = { failure: cleanFailure(b.failure), url: typeof b.page?.url === 'string' ? b.page.url : '' };
+    // what this business has told Agent (owner-approved only), when it fits what's being asked
+    const facts = await knowledge.forPlan(tenant.chatId, [request, ...history.filter((h) => h.who === 'you').map((h) => h.text)].join(' '));
+    const extra = { failure: cleanFailure(b.failure), url: typeof b.page?.url === 'string' ? b.page.url : '', knowledge: facts };
     // With a screenshot and a model that can see, plan from the picture + the list; otherwise (or if that model
     // fails) plan from the list alone, exactly as before. The picture is used for this one call and never kept.
     const shot = cleanShot(b.screenshot);
@@ -2780,6 +2785,7 @@ mountWebApi(app, {
   express,
   auth: webAuth,
   office,
+  knowledge,
   getTenant: (chatId) => store.get(chatId),
   ops: webOps,
   siteOrigin: (() => { try { return new URL(SITE_URL).origin; } catch { return ''; } })(),
