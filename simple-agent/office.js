@@ -237,6 +237,14 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     return { ok: true, chatId: String(row.chat_id) };
   }
 
+  // ---- Does this business also have its own Agent (signed up for it, so it has a plan)? Unknown = no:
+  // the link to the Agent dashboard just stays hidden.
+  async function hasAgent(chatId) {
+    if (!enabled || !/^-?\d{1,20}$/.test(String(chatId ?? ''))) return false;
+    const r = await rest(`tenant_plans?chat_id=eq.${chatId}&select=chat_id&limit=1`);
+    return !!(r.ok && Array.isArray(r.rows) && r.rows.length);
+  }
+
   // ---- Account: a person changes the name shown for them (their own row only)
   async function rename(m, name) {
     if (!enabled || !m?.chatId || !UUID_RE.test(String(m.userId))) return { error: 'unavailable' };
@@ -248,5 +256,5 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     return { ok: true, name: nm };
   }
 
-  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim, rename };
+  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim, rename, hasAgent };
 }

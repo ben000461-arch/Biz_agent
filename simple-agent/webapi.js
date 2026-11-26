@@ -113,7 +113,12 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
       // first sign-in after an invite: match it by their confirmed email, then look again
       if (member.error === 'not_member' && v.email && (await office.claim(v.userId, v.email, v.emailConfirmed)).ok) member = await office.member(v.userId);
       if (member.error === 'unavailable') return res.status(503).json({ error: 'try again in a moment' });
-      if (member.error) return res.status(403).json({ error: 'not_member', message: 'This login isn’t part of an office yet. Ask your office’s owner to add your email.' });
+      if (member.error) {
+        // not in an office, but has their own Agent: the page sends them there instead
+        const link = await auth.chatFor(v.userId).catch(() => ({}));
+        const agent = !!link?.chatId && (await office.hasAgent(link.chatId));
+        return res.status(403).json({ error: 'not_member', hasAgent: agent, message: 'This login isn’t part of an office yet. Ask your office’s owner to add your email.' });
+      }
       req.member = { ...member, userId: v.userId };
       next();
     } catch (err) {
@@ -125,7 +130,9 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
-    return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name } };
+    // only an owner whose business also signed up for Agent gets the link over to the Agent dashboard
+    const hasAgent = req.member.role === 'owner' ? await office.hasAgent(req.member.chatId) : false;
+    return { body: { business: b || { name: 'Your office', accent: null }, role: req.member.role, email: req.member.email, name: req.member.name, hasAgent } };
   }));
   router.post('/office/me/name', cors, limitIp, json, whoOffice, run(async (req) => {
     const r = await office.rename(req.member, req.body?.name);

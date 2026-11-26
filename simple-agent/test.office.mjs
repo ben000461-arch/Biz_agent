@@ -126,6 +126,11 @@ const ex = await office.invite(owner, { email: 'already@demo.test' }, { redirect
 check('invite: someone who already has a login gets a "set your password" link instead', ex.ok && ex.existing === true && ex.sent === true && recovers.at(-1)?.email === 'already@demo.test' && recovers.at(-1).redirect === 'https://www.co-optech.com/office/' && recovers.at(-1).auth.apikey === 'sb_secret_x', { ex, r: recovers.at(-1) });
 const exAgain = await office.resend(owner, db.office_members.find((m) => m.email === 'already@demo.test').id, { redirectTo: 'https://www.co-optech.com/office/' });
 check('resend: works again for them (the stuck case)', exAgain.sent === true && recovers.length === 2);
+// ---- has this business also signed up for Agent?
+db.tenant_plans = [{ chat_id: '100' }];
+check('hasAgent: a business with a plan', (await office.hasAgent('100')) === true);
+check('hasAgent: an office-only business', (await office.hasAgent('555')) === false);
+check('hasAgent: junk id', (await office.hasAgent('1;drop')) === false);
 // ---- Account: rename yourself
 const empRow = db.office_members.find((m) => m.email === 'emp@demo.test');
 const rn = await office.rename({ ...emp, userId: empRow.user_id }, '  Sam\u0007 Ortiz  ');
