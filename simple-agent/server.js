@@ -27,7 +27,10 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import XLSX from 'xlsx';
+import * as XLSXmod from 'xlsx';
+// Works with both the npm build (0.18, one default object) and the safe SheetJS build (0.20+, named exports),
+// so XLSX.version is always there for the Excel safety check in knowledge.js.
+const XLSX = { ...(XLSXmod.default || {}), ...XLSXmod };
 import { createStore, ALL_TOOL_GROUPS } from './tenants.js';
 import { createVault } from './vault.js';
 import { createGoogle, NeedsReconnect, NeedsMoreAccess } from './google.js';
