@@ -18,8 +18,8 @@ const json = (res, code, body) => { res.statusCode = code; res.setHeader('conten
 const sent = [];
 const U = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const jwt = (n) => `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ${n}In0.sig${n}abcd`;
-const users = { [jwt('a')]: U(1), [jwt('b')]: U(2), [jwt('frozen')]: U(3), [jwt('nolink')]: U(4), [jwt('nogoogle')]: U(5) };
-const links = { [U(1)]: '333', [U(2)]: '335', [U(3)]: '444', [U(5)]: '336' };
+const users = { [jwt('a')]: U(1), [jwt('b')]: U(2), [jwt('frozen')]: U(3), [jwt('nolink')]: U(4), [jwt('nogoogle')]: U(5), [jwt('emp')]: U(6) };
+const links = { [U(6)]: '333', [U(1)]: '333', [U(2)]: '335', [U(3)]: '444', [U(5)]: '336' };
 const rows = {}, ledger = [];
 const tg = http.createServer(async (req, res) => {
   const method = req.url.split('/').pop(); const raw = await readBody(req);
@@ -58,6 +58,7 @@ const sb = http.createServer(async (req, res) => {
   const raw = await readBody(req); const u = new URL(req.url, 'http://x');
   if (u.pathname === '/auth/v1/user') { const tok = (req.headers.authorization || '').replace(/^Bearer /, ''); return users[tok] ? json(res, 200, { id: users[tok], email: 'x@e.com' }) : json(res, 401, {}); }
   if (u.pathname.endsWith('/tenant_users')) { const uid = /user_id=eq\.([0-9a-f-]+)/.exec(u.search)?.[1]; return json(res, 200, links[uid] ? [{ chat_id: Number(links[uid]) }] : []); }
+  if (u.pathname.endsWith('/office_members')) { const uid = /user_id=eq\.([0-9a-f-]+)/.exec(u.search)?.[1]; return json(res, 200, uid === U(6) ? [{ role: 'employee', chat_id: '333' }] : uid === U(1) ? [{ role: 'owner', chat_id: '333' }] : []); }
   if (u.pathname.endsWith('/credit_ledger')) {
     if (req.method === 'GET') { const chat = /eq\.(-?\d+)/.exec(u.search)?.[1]; const cycle = /cycle=eq\.([\d-]+)/.exec(u.search)?.[1]; return json(res, 200, ledger.filter((r) => r.chat_id === chat && r.cycle === cycle)); }
     const row = JSON.parse(raw);
@@ -117,6 +118,18 @@ const tomorrow = ymd(new Date(Date.now() + DAY * 1.5));
 const yesterday = ymd(new Date(Date.now() - DAY));
 
 try {
+  console.log('\n[office employees never get the owner\'s agent]');
+  {
+    const E = jwt('emp');
+    for (const p of ['/schedule', '/agents', '/connections']) { const r = await call('GET', p, E); check(`employee: ${p} refused (owner only)`, r.status === 403 && r.body?.error === 'owner_only', JSON.stringify({ s: r.status, b: r.body })); }
+    const del = await call('POST', '/account/delete', E, { confirm: 'DELETE' }); check('employee: cannot delete the owner\'s account', del.status === 403, del);
+    const dis = await call('POST', '/disconnect', E, { provider: 'google' }); check('employee: cannot disconnect the owner\'s tools', dis.status === 403, dis);
+    const chat = await call('POST', '/chat', E, { message: 'read my email' }); check('employee: web chat does not reach the owner\'s agent', chat.status === 200 && /isn’t linked/.test(chat.body?.replies?.[0] || ''), chat);
+    const hist = await call('GET', '/chat/history', E); check('employee: no owner chat history', hist.status === 200 && Array.isArray(hist.body?.messages) && hist.body.messages.length === 0, hist);
+    const plan = await call('POST', '/agent/plan', E, {}); check('employee: the Agent extension still gets through the sign-in check', plan.status !== 403 && plan.status !== 409 && plan.status !== 401, plan);
+    const own = await call('GET', '/schedule', jwt('a')); check('owner of the same business: still has their agent', own.status === 200, JSON.stringify({ s: own.status, b: own.body }));
+  }
+
   console.log('\n[startup + cors]');
   check('startup says the doors are mounted', /schedule and agents doors are mounted/.test(log), log.slice(0, 300));
   let r = await fetch(`${BASE}/agents`, { method: 'OPTIONS', headers: { origin: SITE, 'access-control-request-method': 'GET' } });
