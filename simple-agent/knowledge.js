@@ -20,9 +20,58 @@ export const LIMITS = {
   pendingPerPerson: 25, perBusiness: 1000, reviewNote: 300, listMax: 300,
   planChars: 2000, planItemChars: 700,
 };
-const TEXT_EXT = new Set(['txt', 'md', 'csv', 'tsv']);
-const LATER_EXT = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'pages', 'numbers', 'key', 'rtf']);
-const MIME = { txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel' };
+const TEXT_EXT = new Set(['txt', 'md', 'csv', 'tsv', 'log', 'rtf']);
+// code and config files: read as plain text (never run)
+export const CODE_EXT = new Set(['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'py', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c', 'h', 'cc', 'cpp', 'hpp', 'cs', 'php', 'sh', 'bash', 'zsh', 'ps1', 'sql', 'r', 'lua', 'pl', 'scala', 'dart', 'vue', 'svelte', 'html', 'htm', 'css', 'scss', 'less', 'json', 'yaml', 'yml', 'toml', 'xml', 'ini', 'cfg', 'conf', 'gradle', 'graphql', 'proto', 'tf', 'dockerfile', 'makefile', 'gitignore']);
+const LATER_EXT = new Set(['doc', 'ppt', 'pptx', 'pages', 'numbers', 'key', 'odt', 'png', 'jpg', 'jpeg', 'gif', 'heic', 'webp']);
+const MIME = { txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel', pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+
+// Files that are secrets by their very name: never stored, whatever is inside.
+const SECRET_NAMES = /^(\.env(\..*)?|.*\.(pem|key|p12|pfx|keystore|jks|ovpn|kdbx)|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|\.npmrc|\.netrc|\.pgpass|credentials(\.json)?|service[-_]?account.*\.json|secrets?\.(json|ya?ml|toml))$/i;
+// Passwords and keys inside text. We say WHAT kind we found, never the value.
+const SECRET_PATTERNS = [
+  ['a private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['an Amazon (AWS) key', /\b(AKIA|ASIA)[0-9A-Z]{16}\b/],
+  ['a Google API key', /\bAIza[0-9A-Za-z_-]{35}\b/],
+  ['a GitHub token', /\bgh[pousr]_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}/],
+  ['a Slack token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/],
+  ['a Stripe key', /\b(sk|rk)_live_[0-9a-zA-Z]{20,}/],
+  ['an OpenAI / Anthropic key', /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{32,}/],
+  ['a Supabase secret key', /\bsb_secret_[A-Za-z0-9_-]{10,}/],
+  ['a Groq key', /\bgsk_[A-Za-z0-9]{40,}/],
+  ['a login token', /\beyJ[A-Za-z0-9_-]{15,}\.eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}/],
+  ['a password or secret', /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|client[_-]?secret|auth[_-]?token)["']?\s*[:=]\s*["'][^"'\s]{10,}["']/i],
+];
+export function findSecret(text) {
+  const t = String(text || '');
+  for (const [kind, re] of SECRET_PATTERNS) if (re.test(t)) return kind;
+  return '';
+}
+const secretMsg = (kind) => `This looks like it contains ${kind}. Take it out and try again: Agent should never hold passwords or keys.`;
+
+// Word and Excel files are zip files. Before opening one, read its table of contents and refuse
+// "zip bombs" (tiny files that unpack to gigabytes) and anything unusual. -> '' when fine
+export function zipProblem(buf, { maxEntries = 5000, maxTotal = 100 * 1024 * 1024, maxRatio = 200 } = {}) {
+  if (!buf || buf.length < 22 || buf[0] !== 0x50 || buf[1] !== 0x4b) return 'not_zip';
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) { if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; } }
+  if (eocd < 0) return 'not_zip';
+  const entries = buf.readUInt16LE(eocd + 10), cdSize = buf.readUInt32LE(eocd + 12), cdOff = buf.readUInt32LE(eocd + 16);
+  if (entries === 0xffff || cdOff === 0xffffffff || cdSize === 0xffffffff) return 'too_big'; // ZIP64: far bigger than any office file we take
+  if (entries > maxEntries || cdOff + cdSize > buf.length) return 'too_big';
+  let p = cdOff, total = 0;
+  for (let n = 0; n < entries; n++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) return 'not_zip';
+    const csize = buf.readUInt32LE(p + 20), usize = buf.readUInt32LE(p + 24);
+    if (usize === 0xffffffff || csize === 0xffffffff) return 'too_big';
+    total += usize;
+    if (total > maxTotal) return 'too_big';
+    if (usize > 1024 * 1024 && usize / Math.max(1, csize) > maxRatio) return 'too_big';
+    p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
+  }
+  return '';
+}
+const withLimit = (promise, ms) => Promise.race([promise, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), ms))]);
 
 // The Excel reader on npm (0.18.x) has known problems with booby-trapped files, so we only open Excel with
 // 0.19.3 or newer (installed from SheetJS). Until then we ask for CSV.
@@ -37,22 +86,32 @@ export function safeFileName(name) {
 }
 const extOf = (name) => { const m = /\.([A-Za-z0-9]{1,8})$/.exec(String(name || '')); return m ? m[1].toLowerCase() : ''; };
 
-// Read what we can out of an uploaded file. -> { text, mime } | { error, message }
-export function readFile(name, buf, { xlsx = null } = {}) {
-  const ext = extOf(name);
+// Read what we can out of an uploaded file. -> Promise<{ text, mime } | { error, message }>
+// Nothing in a file is ever run: we only pull text out of it.
+export async function readFile(name, buf, { xlsx = null, pdf = null, docx = null, timeoutMs = 20000 } = {}) {
+  const base = String(name || '').split('/').pop();
+  const ext = extOf(base) || (/^(dockerfile|makefile)$/i.test(base) ? base.toLowerCase() : '');
+  if (SECRET_NAMES.test(base)) return { error: 'secret', message: 'That file holds passwords or keys (like .env or a key file), so it can’t be added. Agent should never hold them.' };
   if (!buf?.length) return { error: 'empty', message: 'That file is empty.' };
   if (buf.length > LIMITS.fileBytes) return { error: 'too_big', message: 'That file is over 10 MB.' };
-  if (TEXT_EXT.has(ext)) {
+  const out = (text, mime) => {
+    const t = tidyText(text, LIMITS.text);
+    const kind = findSecret(t);
+    if (kind) return { error: 'secret', message: secretMsg(kind) };
+    return { text: t, mime };
+  };
+  if (TEXT_EXT.has(ext) || CODE_EXT.has(ext)) {
     let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return { error: 'not_text', message: 'That file isn’t plain text. Save it as .txt or .csv and try again.' }; }
     if (text.includes('\u0000')) return { error: 'not_text', message: 'That file isn’t plain text. Save it as .txt or .csv and try again.' };
-    return { text: tidyText(text.replace(/^﻿/, ''), LIMITS.text), mime: MIME[ext] };
+    return out(text.replace(/^\ufeff/, ''), MIME[ext] || 'text/plain');
   }
   if (ext === 'xlsx' || ext === 'xls') {
     if (!excelOk(xlsx)) return { error: 'excel_later', message: 'Excel files aren’t switched on yet. In Excel or Sheets, use File → Save as / Download → CSV, and upload that.' };
     const zip = buf[0] === 0x50 && buf[1] === 0x4b; // .xlsx is a zip
     const ole = buf[0] === 0xd0 && buf[1] === 0xcf;  // old .xls
     if ((ext === 'xlsx' && !zip) || (ext === 'xls' && !ole && !zip)) return { error: 'not_excel', message: 'That doesn’t look like an Excel file.' };
+    if (zip && zipProblem(buf)) return { error: 'not_excel', message: 'That spreadsheet unpacks to something far too big or odd. Save it as CSV and try again.' };
     try {
       const wb = xlsx.read(buf, { type: 'buffer', dense: true, cellFormula: false, cellHTML: false, cellStyles: false, bookVBA: false, sheetRows: 2000 });
       const parts = [];
@@ -61,11 +120,48 @@ export function readFile(name, buf, { xlsx = null } = {}) {
         if (csv.trim()) parts.push(`# Sheet: ${tidy(sn, 60)}\n${csv}`);
         if (parts.join('\n\n').length > LIMITS.text) break;
       }
-      return { text: tidyText(parts.join('\n\n'), LIMITS.text) || '(no data found)', mime: MIME[ext] };
+      return out(parts.join('\n\n') || '(no data found)', MIME[ext]);
     } catch { return { error: 'not_excel', message: 'Couldn’t read that spreadsheet. Save it as CSV and try again.' }; }
   }
-  if (LATER_EXT.has(ext)) return { error: 'type_later', message: 'PDF, Word and slide files aren’t supported yet. Paste the important part as a note, or save it as .txt.' };
-  return { error: 'type', message: 'That kind of file isn’t supported. Use .txt, .md, .csv or Excel.' };
+  if (ext === 'docx') {
+    if (!docx?.extractRawText) return { error: 'type_later', message: 'Word files aren’t switched on yet. Paste the important part as a note, or save it as .txt.' };
+    if (zipProblem(buf)) return { error: 'not_word', message: 'That doesn’t look like a Word file (or it unpacks to something far too big).' };
+    try {
+      const r = await withLimit(docx.extractRawText({ buffer: buf }), timeoutMs);
+      const text = String(r?.value || '').trim();
+      if (!text) return { error: 'no_text', message: 'That Word file has no text in it.' };
+      return out(text, MIME.docx);
+    } catch { return { error: 'not_word', message: 'Couldn’t read that Word file. Save it as .txt or PDF and try again.' }; }
+  }
+  if (ext === 'pdf') {
+    if (!pdf?.getDocument) return { error: 'type_later', message: 'PDF files aren’t switched on yet. Paste the important part as a note.' };
+    if (buf.subarray(0, 1024).indexOf('%PDF-') < 0) return { error: 'not_pdf', message: 'That doesn’t look like a PDF.' };
+    let doc = null;
+    try {
+      const task = pdf.getDocument({ data: new Uint8Array(buf), isEvalSupported: false, disableFontFace: true, useSystemFonts: false, disableAutoFetch: true, disableStream: true, stopAtErrors: false, verbosity: 0 });
+      doc = await withLimit(task.promise, timeoutMs);
+      const pages = Math.min(doc.numPages, 300);
+      const parts = []; let len = 0;
+      const started = Date.now();
+      for (let i = 1; i <= pages && len < LIMITS.text && Date.now() - started < timeoutMs; i++) {
+        const page = await doc.getPage(i);
+        const tc = await page.getTextContent();
+        let line = '', lines = [];
+        for (const it of tc.items) { line += it.str || ''; if (it.hasEOL) { lines.push(line); line = ''; } }
+        if (line) lines.push(line);
+        const t = lines.join('\n').replace(/[ \t]+\n/g, '\n').trim();
+        if (t) { parts.push(`--- Page ${i} ---\n${t}`); len += t.length; }
+        page.cleanup();
+      }
+      if (!parts.length) return { error: 'no_text', message: 'That PDF has no text in it (it’s probably a scan or photo). Paste the important part as a note for now.' };
+      return out(parts.join('\n\n'), MIME.pdf);
+    } catch (e) {
+      if (e?.name === 'PasswordException') return { error: 'locked', message: 'That PDF has a password. Save a copy without it and try again.' };
+      return { error: 'not_pdf', message: 'Couldn’t read that PDF. Try saving it again, or paste the important part as a note.' };
+    } finally { try { await doc?.destroy(); } catch { /* ignore */ } }
+  }
+  if (LATER_EXT.has(ext)) return { error: 'type_later', message: ext === 'doc' ? 'Old Word files (.doc) aren’t supported. Save it as .docx or PDF and try again.' : 'Pictures and slides aren’t supported yet. Paste the important part as a note.' };
+  return { error: 'type', message: 'That kind of file isn’t supported. Use a document, a spreadsheet, a PDF, or a code/text file.' };
 }
 
 // Pick the approved items that fit what was asked, for the AI. -> string ('' when nothing fits)
@@ -90,7 +186,7 @@ export function pickForPlan(items, query, { chars = LIMITS.planChars, itemChars 
   return out.trim();
 }
 
-export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeoutMs = 10000, now = () => Date.now(), cacheMs = 60000, xlsx = null, newId = () => crypto.randomUUID() } = {}) {
+export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeoutMs = 10000, now = () => Date.now(), cacheMs = 60000, xlsx = null, pdf = null, docx = null, newId = () => crypto.randomUUID() } = {}) {
   const base = String(url || '').trim().replace(/\/+$/, '').replace(/\/rest\/v1$/i, '');
   const secret = String(key || '').trim();
   const enabled = Boolean(base && secret);
@@ -185,6 +281,8 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
     if (!t) return { error: 'no_title' };
     if (!body) return { error: 'no_text' };
     if (String(text ?? '').length > LIMITS.note + 500) return { error: 'too_long' };
+    const secret = findSecret(`${t}\n${body}`);
+    if (secret) return { error: 'secret', message: secretMsg(secret) };
     const space = await room(m);
     if (space.error) return space;
     const row = { id: newId(), chat_id: String(m.chatId), user_id: m.userId, email: m.email || null, kind: 'note', title: t, body, ...fresh(m) };
@@ -197,7 +295,7 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
   async function addFile(m, { name, title, buf } = {}) {
     if (!enabled || !okMember(m)) return { error: 'unavailable' };
     const fileName = safeFileName(name);
-    const read = readFile(fileName, buf, { xlsx });
+    const read = await readFile(fileName, buf, { xlsx, pdf, docx });
     if (read.error) return read;
     const space = await room(m);
     if (space.error) return space;
@@ -250,5 +348,5 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
     return { buf: r.buf, name: g.row.file_name || 'file' };
   }
 
-  return { enabled, list, read, addNote, addFile, review, remove, download, pendingCount, forPlan, forget, excel: excelOk(xlsx) };
+  return { enabled, list, read, addNote, addFile, review, remove, download, pendingCount, forPlan, forget, excel: excelOk(xlsx), pdf: !!pdf?.getDocument, word: !!docx?.extractRawText };
 }

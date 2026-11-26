@@ -2522,7 +2522,11 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
 const office = createOffice({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY }); // the Office dashboard's data (supabase/office.sql)
 // notes and files a business gives its Agent; only owner-approved ones reach the AI (supabase/office_knowledge.sql)
-const knowledge = createKnowledge({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY, xlsx: XLSX });
+// PDF and Word readers are optional: if they aren't installed, those file types just say "not switched on yet"
+let PDFJS = null, MAMMOTH = null;
+try { PDFJS = await import('pdfjs-dist/legacy/build/pdf.mjs'); } catch { console.warn('[knowledge] PDF reader not installed (npm i pdfjs-dist): PDFs are off'); }
+try { MAMMOTH = (await import('mammoth')).default; } catch { console.warn('[knowledge] Word reader not installed (npm i mammoth): Word files are off'); }
+const knowledge = createKnowledge({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY, xlsx: XLSX, pdf: PDFJS, docx: MAMMOTH });
 mountBilling(app, { auth: webAuth, entitlements, getTenant: (chatId) => store.get(chatId), supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, log: console.log, notify: (text) => (ADMIN_ID ? sendTelegramMessage(ADMIN_ID, '💳 ' + text) : null) });
 const toolReq = mountToolRequests(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, adminId: ADMIN_ID, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), describeChat: (chatId) => store.get(chatId)?.name || store.get(chatId)?.business || '', log: console.log });
 const toolConn = mountToolConn(app, { auth: webAuth, supabaseUrl: SUPABASE_URL, supabaseKey: SUPABASE_SERVICE_KEY, notifyAdmin: (t) => sendTelegramMessage(ADMIN_ID, t), notifyUser: (chatId, t) => sendTelegramMessage(chatId, t), log: console.log });
