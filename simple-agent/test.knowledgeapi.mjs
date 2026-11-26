@@ -6,7 +6,9 @@ const check = (name, ok, extra) => { if (ok) { pass++; console.log('PASS', name)
 const U = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const people = { 'tok-owner': { userId: U(1), email: 'ben@x.test', role: 'owner' }, 'tok-emp': { userId: U(2), email: 'sam@x.test', role: 'employee' } };
 const auth = { verify: async (t) => (people[t] ? { userId: people[t].userId, email: people[t].email, emailConfirmed: true } : { error: 'unauthorized' }), chatFor: async () => ({ error: 'unlinked' }) };
-const office = { enabled: true, member: async (uid) => { const p = Object.values(people).find((x) => x.userId === uid); return p ? { chatId: '100', role: p.role, email: p.email, name: '' } : { error: 'not_member' }; }, business: async () => ({ name: 'Demo' }), hasAgent: async () => false, claim: async () => ({}) };
+const office = { enabled: true, member: async (uid) => { const p = Object.values(people).find((x) => x.userId === uid); return p ? { chatId: '100', role: p.role, email: p.email, name: '' } : { error: 'not_member' }; }, business: async () => ({ name: 'Demo' }), hasAgent: async () => false, claim: async () => ({}),
+  rulesFor: async () => ({ sites: { mode: 'any', allow: [], block: [] }, approval: 'small', never: { money: true, send: false, delete: false } }),
+  setRules: async (m, r) => (m.role !== 'owner' ? { error: 'owner_only' } : r?.sites?.block?.[0] === 'bad' ? { error: 'bad_site', site: 'bad' } : { ok: true, rules: r }) };
 const seen = [];
 const knowledge = {
   enabled: true, excel: false,
@@ -52,6 +54,12 @@ try {
   check('download: the file name can\'t break the header', !/"[^"]*"[^;]*"/.test(dl.h.get('content-disposition')) && dl.h.get('content-disposition').includes("filename*=UTF-8''pr%22ice%20%C3%BC.csv"), dl.h.get('content-disposition'));
   check('download: the file comes back byte for byte', dl.body.toString() === '<script>alert(1)</script>');
   check('download: missing → 404', (await go('/knowledge/file?id=zzz', { tok: 'tok-owner' })).status === 404);
+  const rr = await go('/rules', { tok: 'tok-emp' });
+  check('rules: everyone in the office can read them; only the owner may edit', rr.status === 200 && rr.body.rules.never.money === true && rr.body.canEdit === false && (await go('/rules', { tok: 'tok-owner' })).body.canEdit === true);
+  check('rules: an employee can\'t change them', (await go('/rules', { method: 'POST', tok: 'tok-emp', type: 'application/json', body: JSON.stringify({ rules: {} }) })).status === 403);
+  const rb = await go('/rules', { method: 'POST', tok: 'tok-owner', type: 'application/json', body: JSON.stringify({ rules: { sites: { block: ['bad'] } } }) });
+  check('rules: a bad site comes back as a plain message', rb.status === 400 && /“bad” isn’t a website address/.test(rb.body.message));
+  check('rules: signed out refused', (await go('/rules')).status === 401);
   const pre = await fetch(base + '/knowledge/upload', { method: 'OPTIONS', headers: { origin: 'https://www.co-optech.com', 'access-control-request-method': 'POST' } });
   check('the dashboard is allowed to call the upload route (preflight)', pre.status === 204 && pre.headers.get('access-control-allow-origin') === 'https://www.co-optech.com');
 } finally { srv.close(); }

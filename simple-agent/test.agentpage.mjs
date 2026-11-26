@@ -243,10 +243,12 @@ const ollama = http.createServer(async (req, res) => {
 const logged = [];
 const TOK_A = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.sigaabcd', TOK_NO = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJubyJ9.signoabcd';
 const users = { [TOK_A]: '00000000-0000-4000-8000-000000000001', [TOK_NO]: '00000000-0000-4000-8000-000000000009' };
+let officeRules = null; // the office's rules (null = not an office)
 const sb = http.createServer(async (req, res) => {
   const raw = await readBody(req); const u = new URL(req.url, 'http://x');
   if (u.pathname === '/auth/v1/user') { const t = (req.headers.authorization || '').replace(/^Bearer /, ''); return users[t] ? json(res, 200, { id: users[t] }) : json(res, 401, {}); }
   if (u.pathname === '/rest/v1/tenant_users') { const uid = (u.searchParams.get('user_id') || '').replace('eq.', ''); return json(res, 200, uid === users[TOK_A] ? [{ chat_id: 333 }] : []); }
+  if (u.pathname === '/rest/v1/office_businesses') return json(res, 200, officeRules && u.searchParams.get('chat_id') === 'eq.333' ? [{ rules: officeRules }] : []);
   if (u.pathname === '/rest/v1/agent_logs' && req.method === 'POST') { for (const r of [].concat(JSON.parse(raw || '[]'))) logged.push(r); return json(res, 201, []); }
   json(res, 200, []);
 });
@@ -333,14 +335,15 @@ try {
 
   // ---- with a hosted model (fake Groq): screenshot -> vision; too big -> text; all too big -> honest "busy"
   console.log('\n[hosted models]');
-  let groqMode = 'ok'; const groqSeen = [];
+  let groqMode = 'ok'; const groqSeen = []; let rulePlan = null;
   const groq = http.createServer(async (req, res) => {
     const body = JSON.parse(await readBody(req));
     const content = body.messages[body.messages.length - 1].content;
     const hasImage = Array.isArray(content) && content.some((p) => p.type === 'image_url');
     groqSeen.push({ model: body.model, hasImage });
     if (groqMode === 'toolarge' || (hasImage && groqMode === 'visiontoolarge')) return json(res, 413, { error: { message: 'Request too large for model on tokens per minute' } });
-    json(res, 200, { choices: [{ message: { content: JSON.stringify({ say: 'Opening Compose.', steps: [{ do: 'click', id: 'e5' }] }) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
+    const out = groqMode === 'rules' ? rulePlan : { say: 'Opening Compose.', steps: [{ do: 'click', id: 'e5' }] };
+    json(res, 200, { choices: [{ message: { content: JSON.stringify(out) } }], usage: { prompt_tokens: 10, completion_tokens: 5 } });
   });
   await new Promise((r) => groq.listen(P.groq, r));
   const proc2 = spawn('node', ['server.js'], {
@@ -349,7 +352,7 @@ try {
       TELEGRAM_API_BASE: `http://127.0.0.1:${P.tg}`, OLLAMA_HOST: `http://127.0.0.1:${P.ollama}`, PORT: String(P.app2),
       TENANTS_FILE: tenantsFile, WORKSPACES_DIR: path.join(tmp, 'ws2'), CONNECTIONS_FILE: path.join(tmp, 'conn2.json'),
       SITE_URL: 'https://site.test/coop/', SUPABASE_URL: `http://127.0.0.1:${P.sb}`, SUPABASE_SERVICE_KEY: 'sb_secret_test',
-      AGENT_TICK_MS: '600000', EVENT_POLL_MS: '600000', SIGNUP_POLL_MS: '600000' },
+      AGENT_TICK_MS: '600000', EVENT_POLL_MS: '600000', SIGNUP_POLL_MS: '600000', OFFICE_CACHE_MS: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
@@ -367,6 +370,33 @@ try {
     r = await call2({ request: 'write a draft', page: PAGE, screenshot: img });
     check('every hosted model at its limit -> an honest "wait a minute", not a guess', r.status === 429 && r.body.error === 'busy' && /Wait about a minute/.test(r.body.message), JSON.stringify(r));
     check('...and it never falls back to the tiny local model for page work', prompts.length === 0);
+
+    // ---- office rules, enforced by the server (the extension can't get around them)
+    console.log('\n[office rules]');
+    const SHOP = { url: 'https://shop.example.com/cart', title: 'Cart', text: 'Your cart', elements: [
+      { id: 'e1', kind: 'field', type: 'text', label: 'Card number' }, { id: 'e2', kind: 'button', label: 'Pay now' },
+      { id: 'e3', kind: 'button', label: 'Send message' }, { id: 'e4', kind: 'button', label: 'Delete order' },
+      { id: 'e5', kind: 'button', label: 'Save for later' }, { id: 'e6', kind: 'checkbox', label: 'Gift wrap', checked: false },
+      { id: 't1', kind: 'tab', label: 'Bank (chase.com)' } ] };
+    groqMode = 'rules';
+    rulePlan = { say: 'ok', steps: [{ do: 'check', id: 'e6' }] };
+    const base = { sites: { mode: 'any', allow: [], block: [] }, approval: 'small', never: { money: true, send: false, delete: false } };
+    officeRules = { ...base, sites: { mode: 'any', allow: [], block: ['example.com'] } }; groqSeen.length = 0;
+    r = await call2({ request: 'gift wrap it', page: SHOP });
+    check('blocked site (example.com covers shop.example.com): refused before any AI call', r.status === 403 && r.body.error === 'rule_site' && /shop\.example\.com/.test(r.body.message) && groqSeen.length === 0, JSON.stringify(r));
+    officeRules = base;
+    rulePlan = { say: 'Paying.', steps: [{ do: 'check', id: 'e6' }, { do: 'fill', id: 'e1', value: '4111111111111111' }, { do: 'click', id: 'e2' }] };
+    r = await call2({ request: 'pay for it', page: SHOP });
+    check('never pay (the default): card details and "Pay now" taken out by the server, the rest kept, with the reason', r.status === 200 && r.body.steps.length === 1 && r.body.steps[0].label === 'Gift wrap' && /don’t let Agent pay/.test(r.body.warning || ''), JSON.stringify(r));
+    rulePlan = { say: 'Opening the bank.', steps: [{ do: 'open', value: 'https://www.chase.com/login' }] };
+    officeRules = { ...base, sites: { mode: 'any', allow: [], block: ['chase.com'] } };
+    r = await call2({ request: 'check the bank', page: SHOP });
+    check('Agent can\'t OPEN a blocked site either', r.status === 200 && r.body.steps.length === 0 && r.body.more === false && /chase\.com/.test(r.body.warning || ''), JSON.stringify(r.body));
+    rulePlan = { say: 'ok', steps: [{ do: 'check', id: 'e6' }] };
+    officeRules = { ...base, approval: 'every' };
+    r = await call2({ request: 'gift wrap it', page: SHOP });
+    check('"ask before every batch": no running on its own, and the extension is told not to carry on', r.status === 200 && r.body.auto === false && r.body.askEvery === true, JSON.stringify(r.body));
+    officeRules = null;
   } finally { proc2.kill('SIGTERM'); groq.close(); await wait(300); }
 } finally {
   proc.kill('SIGTERM'); await wait(300);

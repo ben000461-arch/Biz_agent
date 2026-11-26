@@ -126,6 +126,23 @@ const ex = await office.invite(owner, { email: 'already@demo.test' }, { redirect
 check('invite: someone who already has a login gets a "set your password" link instead', ex.ok && ex.existing === true && ex.sent === true && recovers.at(-1)?.email === 'already@demo.test' && recovers.at(-1).redirect === 'https://www.co-optech.com/office/' && recovers.at(-1).auth.apikey === 'sb_secret_x', { ex, r: recovers.at(-1) });
 const exAgain = await office.resend(owner, db.office_members.find((m) => m.email === 'already@demo.test').id, { redirectTo: 'https://www.co-optech.com/office/' });
 check('resend: works again for them (the stuck case)', exAgain.sent === true && recovers.length === 2);
+// ---- rules
+{
+  const bizRow = db.office_businesses?.find((b) => String(b.chat_id) === '100');
+  if (!db.office_businesses) db.office_businesses = [];
+  if (!bizRow) db.office_businesses.push({ chat_id: '100', name: 'Demo' });
+  const r0 = await office.rulesFor('100');
+  check('rules: none saved yet = the defaults', r0 && r0.sites.mode === 'any' && r0.never.money === true && r0.approval === 'small', r0);
+  check('rules: not an office = no rules at all', (await office.rulesFor('999')) === null);
+  check('rules: only the owner can change them', (await office.setRules(emp, { approval: 'every' })).error === 'owner_only');
+  const bad = await office.setRules(owner, { sites: { mode: 'any', block: ['not a site'] } });
+  check('rules: a bad site is refused and named', bad.error === 'bad_site' && bad.site === 'not a site');
+  const ok = await office.setRules(owner, { sites: { mode: 'any', allow: [], block: ['https://www.chase.com/'] }, approval: 'task', never: { money: true, send: true, delete: false } });
+  const row = db.office_businesses.find((b) => String(b.chat_id) === '100');
+  check('rules: saved cleaned, with who and when', ok.ok && row.rules.sites.block[0] === 'chase.com' && row.rules.approval === 'task' && row.rules.updatedBy === owner.email && row.rules.updatedAt, row.rules);
+  const r1 = await office.rulesFor('100');
+  check('rules: the new rules apply right away (cache cleared)', r1.approval === 'task' && r1.never.send === true && r1.updatedBy === owner.email);
+}
 // ---- has this business also signed up for Agent?
 db.tenant_plans = [{ chat_id: '100' }];
 check('hasAgent: a business with a plan', (await office.hasAgent('100')) === true);
