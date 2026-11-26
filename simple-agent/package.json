@@ -12,7 +12,9 @@
   "dependencies": {
     "dotenv": "^18.0.4",
     "express": "^5.2.1",
-    "xlsx": "^0.18.5"
+    "mammoth": "^1.13.0",
+    "pdfjs-dist": "^6.5.438",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "type": "module"
 }

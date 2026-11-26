@@ -205,7 +205,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   const knId = (v) => String(v ?? '').slice(0, 40);
   router.get('/office/knowledge', cors, limitIp, needKn, whoOffice, run(async (req) => {
     const r = await knowledge.list(req.member);
-    return knOut(r) || { body: { items: r.items, excel: knowledge.excel } };
+    return knOut(r) || { body: { items: r.items, excel: knowledge.excel, pdf: !!knowledge.pdf, word: !!knowledge.word } };
   }));
   router.get('/office/knowledge/item', cors, limitIp, needKn, whoOffice, run(async (req) => {
     const r = await knowledge.read(req.member, knId(req.query.id));
