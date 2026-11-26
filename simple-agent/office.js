@@ -1,3 +1,4 @@
+import { readRules, cleanRules } from './rules.js';
 // Office AI: the business, its people, and what Agent did for them (supabase/office.sql).
 //
 // The agent server is the only thing that writes these tables (with the service key). Every read here is
@@ -245,6 +246,32 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     return !!(r.ok && Array.isArray(r.rows) && r.rows.length);
   }
 
+  // ---- Rules (rules.js): what this office lets Agent do. Read on every plan, so cached briefly.
+  // -> rules | null (not an office: no rules) | { error: 'unavailable' } (couldn't check: callers stop)
+  const ruleCache = new Map();
+  async function rulesFor(chatId) {
+    if (!enabled || !CHAT_RE.test(String(chatId ?? ''))) return null;
+    const hit = ruleCache.get(String(chatId));
+    if (hit && hit.until > now()) return hit.value;
+    const r = await rest(`office_businesses?chat_id=eq.${chatId}&select=rules&limit=1`);
+    if (!r.ok) return { error: 'unavailable' };
+    const value = r.rows[0] ? { ...readRules(r.rows[0].rules), updatedAt: r.rows[0].rules?.updatedAt || null, updatedBy: r.rows[0].rules?.updatedBy || null } : null;
+    ruleCache.set(String(chatId), { value, until: now() + Math.min(cacheMs, 30000) });
+    if (ruleCache.size > 500) ruleCache.delete(ruleCache.keys().next().value);
+    return value;
+  }
+  async function setRules(m, input) {
+    if (!enabled || !m?.chatId) return { error: 'unavailable' };
+    if (m.role !== 'owner') return { error: 'owner_only' };
+    const c = cleanRules(input);
+    if (c.error) return c;
+    const stored = { ...c.rules, updatedAt: new Date(now()).toISOString(), updatedBy: m.email || null };
+    const r = await rest(`office_businesses?chat_id=eq.${m.chatId}`, { method: 'PATCH', body: { rules: stored }, prefer: 'return=minimal' });
+    if (!r.ok) return { error: 'unavailable' };
+    ruleCache.delete(String(m.chatId));
+    return { ok: true, rules: stored };
+  }
+
   // ---- Account: a person changes the name shown for them (their own row only)
   async function rename(m, name) {
     if (!enabled || !m?.chatId || !UUID_RE.test(String(m.userId))) return { error: 'unavailable' };
@@ -256,5 +283,5 @@ export function createOffice({ url, key, fetchImpl = globalThis.fetch, timeoutMs
     return { ok: true, name: nm };
   }
 
-  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim, rename, hasAgent };
+  return { enabled, member, forget, business, logTask, activity, summary, team, invite, resend, remove, claim, rename, hasAgent, rulesFor, setRules };
 }

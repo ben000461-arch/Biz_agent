@@ -127,7 +127,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     }
   };
   const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
-  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name', '/office/knowledge', '/office/knowledge/item', '/office/knowledge/file', '/office/knowledge/note', '/office/knowledge/upload', '/office/knowledge/review', '/office/knowledge/remove'], cors, (_req, res) => res.status(204).end());
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name', '/office/knowledge', '/office/knowledge/item', '/office/knowledge/file', '/office/knowledge/note', '/office/knowledge/upload', '/office/knowledge/review', '/office/knowledge/remove', '/office/rules'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
     // only an owner whose business also signed up for Agent gets the link over to the Agent dashboard
@@ -188,6 +188,25 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     if (r.ok && r.userId) auth.forgetLink?.(r.userId); // cut the extension off right away too
     return r.error ? teamOut(r) : { body: { ok: true } };
   }));
+  // ---- Rules (rules.js): everyone in the office can read them; only the owner changes them.
+  const RULE_ERR = {
+    bad_site: (r) => `“${r.site}” isn’t a website address. Use something like example.com.`,
+    too_many_sites: () => 'That’s too many sites for one list (100 at most).',
+    empty_allow: () => 'Add at least one site, or choose “Any site”. Otherwise Agent couldn’t work anywhere.',
+    owner_only: () => 'Only your office’s owner can change the rules.',
+  };
+  router.get('/office/rules', cors, limitIp, whoOffice, run(async (req) => {
+    const r = await office.rulesFor(req.member.chatId);
+    if (r?.error) return { status: 503, body: { error: 'try again in a moment' } };
+    return { body: { rules: r || null, canEdit: req.member.role === 'owner' } };
+  }));
+  router.post('/office/rules', cors, limitIp, json, whoOffice, run(async (req) => {
+    const r = await office.setRules(req.member, req.body?.rules);
+    if (r.error === 'unavailable') return { status: 503, body: { error: 'try again in a moment', message: 'Couldn’t save the rules right now. Try again in a moment.' } };
+    if (r.error) return { status: r.error === 'owner_only' ? 403 : 400, body: { error: r.error, message: (RULE_ERR[r.error] || (() => 'Couldn’t save those rules.'))(r) } };
+    return { body: { ok: true, rules: r.rules } };
+  }));
+
   // ---- Knowledge: notes and files for Agent. Employees' wait for the owner's approval (knowledge.js).
   const KN_ERR = {
     no_title: [400, 'Give it a short title.'], no_text: [400, 'Type the note.'], too_long: [400, 'That note is too long. Keep it under 5,000 characters.'],

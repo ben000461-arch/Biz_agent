@@ -58,6 +58,7 @@ import * as agentKit from './agents.js';
 import { mountWebApi } from './webapi.js';
 import { createOffice } from './office.js';
 import { createKnowledge } from './knowledge.js';
+import { siteProblem, applyRules } from './rules.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2520,7 +2521,7 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 // The website's chat box. Same engine as Telegram; the answer goes back to the page instead.
 // Only the website's own address may call it (SITE_URL, plus WEB_ORIGINS if you list more, comma-separated).
 const webAuth = createWebAuth({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY });
-const office = createOffice({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY }); // the Office dashboard's data (supabase/office.sql)
+const office = createOffice({ url: SUPABASE_URL, key: SUPABASE_SERVICE_KEY, ...(Number(process.env.OFFICE_CACHE_MS) > 0 ? { cacheMs: Number(process.env.OFFICE_CACHE_MS) } : {}) }); // the Office dashboard's data (supabase/office.sql)
 // notes and files a business gives its Agent; only owner-approved ones reach the AI (supabase/office_knowledge.sql)
 // PDF and Word readers are optional: if they aren't installed, those file types just say "not switched on yet"
 let PDFJS = null, MAMMOTH = null;
@@ -2580,6 +2581,11 @@ const webOps = {
     const rl = entitlements.enabled ? meter.allowMessage(tenant.chatId, ent?.plan?.perMinute) : { ok: true };
     if (!rl.ok) return { status: 429, body: { error: 'slow', message: 'Slow down a little and try again in a minute.' } };
     const ctx = { tenant, ent };
+    // the office's rules (rules.js): a blocked site stops here, before any AI call. If they can't be read, stop
+    // too: guessing could let Agent do something the owner forbade.
+    const rules = office.enabled ? await office.rulesFor(tenant.chatId) : null;
+    if (rules?.error) return { status: 503, body: { error: 'rules', message: 'Couldn’t check your office’s rules right now. Try again in a moment. Nothing was changed.' } };
+    if (rules) { const why = siteProblem(rules, b.page?.url); if (why) return { status: 403, body: { error: 'rule_site', message: why } }; }
     const round = Math.max(1, Math.min(MAX_ROUNDS, Number.parseInt(b.round, 10) || 1));
     const history = cleanHistory(b.history);
     // what this business has told Agent (owner-approved only), when it fits what's being asked
@@ -2615,10 +2621,18 @@ const webOps = {
       }
     }
     const plan = checkPlan(data, c.snapshot, round);
+    // the office's rules: forbidden steps come out, and the approval setting decides what may run on its own
+    let ruleNotes = [], askEvery = false;
+    if (rules) {
+      const r = applyRules(rules, plan.steps);
+      if (r.removed.length) { plan.dropped.push(...r.removed); ruleNotes = r.removed; plan.steps = r.steps; if (!plan.steps.length) plan.more = false; }
+      if (r.noAuto) plan.auto = false;
+      askEvery = r.askEvery;
+    }
     logEvent(tenant, { kind: 'action', action: 'agent_page', status: plan.steps.length ? 'proposed' : 'no_steps', detail: `${c.snapshot.host} · ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}` });
     const warn = ent ? await settle(ctx, tenant, 'agent_page', 'action') : null;
-    const warning = [...plan.mathWarnings, ...(warn ? [warn] : [])].join(' ') || undefined;
-    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, saw, ...(warning ? { warning } : {}) } };
+    const warning = [...ruleNotes, ...plan.mathWarnings, ...(warn ? [warn] : [])].join(' ') || undefined;
+    return { body: { say: plan.say, steps: plan.steps, dropped: plan.dropped.length, auto: plan.auto, more: plan.more, round, saw, ...(askEvery ? { askEvery: true } : {}), ...(warning ? { warning } : {}) } };
   },
   // What happened after the plan: approved and done, partly done, or cancelled. Counts only, never page content.
   async agentLog(tenant, b, userId) {
