@@ -12,6 +12,8 @@
 //   - card numbers and Social Security numbers are masked before anything reaches a model
 //   - nothing from the page is logged: only the site's host name and step counts
 
+import { GOOGLE_DO, cleanGoogleStep } from './officegoogle.js';
+
 export const MAX_STEPS = 20;
 const MAX_ELEMENTS = 300;
 const MAX_TEXT = 6000;
@@ -125,7 +127,7 @@ function goalLines(history, request) {
   return `THE TASK SO FAR, in the employee's own words (oldest first). Keep ALL of it in mind and finish what's still missing:\n${asks.map((a, i) => `${i + 1}. ${a}`).join('\n')}\n\n`;
 }
 
-export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET, failure = '', url = '', knowledge = '' } = {}) {
+export function planPrompt(snapshot, request, history = [], round = 1, { screenshot = false, budget = PROMPT_BUDGET, failure = '', url = '', knowledge = '', google = '' } = {}) {
   const lines = snapshot.elements.map((e) => {
     let line = `${e.id} | ${e.kind}${e.type ? `:${e.type}` : ''}${e.role ? ` (${e.role})` : ''} | "${clip(e.label, 90)}"`;
     if (e.popup) line += ' | opens a menu';
@@ -183,7 +185,7 @@ Documents and editors (kind "document": a Google Doc, an email body, a notes edi
 - New text automatically matches the document's current style. Only give a style when they ask for a different look, and then keep it the same for every paragraph.
 - To change how existing text looks (font, spacing, remove or add indents), "replace" it with exactly the same text plus the new style. Don't click toolbar formatting buttons for that: nothing is selected, so they do nothing.
 
-Respond ONLY with JSON: {"say": string, "more": boolean, "steps": [{"do": "fill"|"insert"|"submit"|"replace"|"clear"|"undo"|"select"|"check"|"uncheck"|"click", "id": string, "value": string|null, "find": string|null, "swap": boolean|null, "style": object|null}]}`;
+${google ? `\n${google}\n\n` : ''}Respond ONLY with JSON: {"say": string, "more": boolean, "steps": [{"do": "fill"|"insert"|"submit"|"replace"|"clear"|"undo"|"select"|"check"|"uncheck"|"click"${google ? '|"gmail_draft"|"calendar_add"' : ''}, "id": string, "value": string|null, "find": string|null, "swap": boolean|null, "style": object|null${google ? ', "to": string|null, "subject": string|null, "start": string|null, "end": string|null' : ''}}]}`;
   // fit the page into the budget: shorter page text first, then fewer (least useful) items
   let text = clip(snapshot.text || '', budget.text);
   let shown = lines.length;
@@ -226,7 +228,9 @@ export function safeUrl(v) {
   return u;
 }
 
-export function checkPlan(data, snapshot, round = 1) {
+// google = { tz, now } when this person's own Google is connected and the office allows it; otherwise Google
+// steps are dropped like any unknown action.
+export function checkPlan(data, snapshot, round = 1, { google = null } = {}) {
   const byId = new Map(snapshot.elements.map((e) => [e.id, e]));
   const steps = [];
   const dropped = [];
@@ -235,6 +239,11 @@ export function checkPlan(data, snapshot, round = 1) {
     if (steps.length >= MAX_STEPS) { dropped.push('too many steps'); break; }
     const action = String(s?.do || '').toLowerCase();
     const el = byId.get(String(s?.id || ''));
+    if (GOOGLE_DO.has(action) && google) {
+      const g = cleanGoogleStep(s, google);
+      if (g.error) dropped.push(g.error); else steps.push(g.step);
+      continue;
+    }
     if (!ACTIONS[action]) { dropped.push(`unknown action "${clip(action, 20)}"`); continue; }
     if (action === 'open') { // open a web page in a new tab: only plain http(s) addresses
       const u = safeUrl(s?.value);
@@ -293,6 +302,7 @@ export function checkPlan(data, snapshot, round = 1) {
   }
   const auto = steps.length > 0 && steps.length <= AUTO_MAX_STEPS && steps.every((st) => {
     if (st.do === 'open' || st.do === 'switch') return true; // just looking at another page; nothing changes
+    if (st.kind === 'google') return false; // saving to their Gmail or calendar always waits for Approve
     const el = byId.get(st.id);
     if (st.do === 'fill') return el.kind === 'document' || !el.value;
     if (st.do === 'insert') return !st.swap || /_{3,}/.test(st.find); // adding next to text, or filling a blank line

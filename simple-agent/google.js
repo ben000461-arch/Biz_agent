@@ -60,10 +60,13 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
   return {
     redirectUri,
 
-    startSignIn(chatId) {
+    // chatId is whose sign-in this is: a business's chat, or "u:<user id>" for one person in an office.
+    // back = where to send them afterwards ('office' = the Office dashboard; otherwise the chat is told).
+    startSignIn(chatId, { back = '' } = {}) {
       for (const [s, v] of pending) if (Date.now() > v.expires) pending.delete(s);
+      if (pending.size > 5000) pending.delete(pending.keys().next().value); // never grows without limit
       const state = crypto.randomBytes(16).toString('hex');
-      pending.set(state, { chatId: String(chatId), expires: Date.now() + STATE_TTL });
+      pending.set(state, { chatId: String(chatId), back: back === 'office' ? 'office' : '', expires: Date.now() + STATE_TTL });
       const q = new URLSearchParams({
         client_id: clientId,
         redirect_uri: redirectUri,
@@ -76,23 +79,28 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
       return `${AUTH}?${q}`;
     },
 
+    // where a sign-in started from ('office' or ''), without using it up
+    peekBack(state) { const e = pending.get(String(state)); return e && Date.now() <= e.expires ? e.back : ''; },
+    dropState(state) { pending.delete(String(state)); },
+
     // Called by the callback route. Returns { chatId, email } or throws.
     async finishSignIn(state, code) {
       const entry = pending.get(state);
       pending.delete(state); // single use, whatever happens next
-      if (!entry || Date.now() > entry.expires) throw new Error('This sign-in link expired — send /connect again.');
+      if (!entry || Date.now() > entry.expires) { const e = new Error('This sign-in link expired. Start again from where you clicked Connect.'); e.back = entry?.back || ''; throw e; }
+      const fail = (msg) => { const e = new Error(msg); e.back = entry.back; return e; };
 
       const { ok, data } = await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: redirectUri });
       if (!ok || !data.access_token) {
         // Google's reason (e.g. invalid_client = wrong secret, redirect_uri_mismatch). Never contains secrets.
         console.error(`Google token exchange failed: ${data.error || 'unknown'}${data.error_description ? ` — ${data.error_description}` : ''}`);
-        throw new Error('Google did not accept the sign-in. Try /connect again.');
+        throw fail('Google did not accept the sign-in. Try connecting again.');
       }
-      if (!data.refresh_token) throw new Error('Google did not grant lasting access. Remove "Biz Agent" in your Google account permissions, then try /connect again.');
+      if (!data.refresh_token) throw fail('Google did not grant lasting access. Remove co|op in your Google account’s third-party access, then try connecting again.');
 
       const granted = String(data.scope || '');
       const missing = GOOGLE_SCOPES.filter((s) => !granted.includes(s));
-      if (missing.length) throw new Error('Some permissions were unticked on the Google screen. Try /connect again and leave them all ticked.');
+      if (missing.length) throw fail('Some permissions were unticked on the Google screen. Try connecting again and leave them all ticked.');
 
       let email = null;
       try {
@@ -102,10 +110,12 @@ export function createGoogle({ clientId, clientSecret, publicUrl, vault, bases =
 
       vault.set(entry.chatId, 'google', { refresh_token: data.refresh_token }, { email });
       accessCache.set(entry.chatId, { token: data.access_token, expiresAt: Date.now() + (data.expires_in || 3600) * 1000 - 60_000 });
-      return { chatId: entry.chatId, email };
+      return { chatId: entry.chatId, email, back: entry.back };
     },
 
     isConnected: (chatId) => Boolean(vault.get(chatId, 'google')),
+    // which account (for showing "connected as …"); never the token
+    connectedEmail: (chatId) => vault.status(chatId).find((c) => c.provider === 'google')?.email || null,
 
     async accessToken(chatId) {
       const id = String(chatId);

@@ -6,6 +6,7 @@
 //             'task'  = ask once per task (no step runs without a yes)
 //             'every' = ask before every batch of steps, even later rounds of an approved task
 //   never     kinds of actions Agent may never take: paying/buying, sending, deleting
+//   google    may people connect their OWN Google, so Agent can save Gmail drafts and add calendar events
 //
 // A blocked site stops planning before any AI call. Forbidden steps are taken out of a plan before the
 // extension ever sees them, with a plain reason.
@@ -13,9 +14,10 @@
 export const APPROVAL = ['small', 'task', 'every'];
 export const NEVER = ['money', 'send', 'delete'];
 export const MAX_SITES = 100;
+export const GOOGLE_STEPS = new Set(['gmail_draft', 'calendar_add']); // run by the agent server with the person's own Google
 
 export function defaultRules() {
-  return { sites: { mode: 'any', allow: [], block: [] }, approval: 'small', never: { money: true, send: false, delete: false } };
+  return { sites: { mode: 'any', allow: [], block: [] }, approval: 'small', never: { money: true, send: false, delete: false }, google: true };
 }
 
 // "https://www.Chase.com/login" -> "chase.com". -> '' when it isn't a site name.
@@ -48,7 +50,8 @@ export function cleanRules(input) {
   if (mode === 'only' && !lists.allow.length) return { error: 'empty_allow' };
   const approval = APPROVAL.includes(inp.approval) ? inp.approval : d.approval;
   const never = Object.fromEntries(NEVER.map((k) => [k, typeof inp.never?.[k] === 'boolean' ? inp.never[k] : d.never[k]]));
-  return { rules: { sites: { mode, allow: lists.allow, block: lists.block }, approval, never } };
+  const google = typeof inp.google === 'boolean' ? inp.google : d.google;
+  return { rules: { sites: { mode, allow: lists.allow, block: lists.block }, approval, never, google } };
 }
 
 // Stored value (maybe old or partly missing) -> full rules, never throws
@@ -59,7 +62,7 @@ export function readRules(stored) {
   const d = defaultRules();
   const keep = (list) => (Array.isArray(list) ? [...new Set(list.map(normHost).filter(Boolean))].slice(0, MAX_SITES) : []);
   const allow = keep(stored?.sites?.allow), block = keep(stored?.sites?.block);
-  return { ...d, sites: { mode: stored?.sites?.mode === 'only' && allow.length ? 'only' : 'any', allow, block }, approval: APPROVAL.includes(stored?.approval) ? stored.approval : d.approval, never: { ...d.never, ...Object.fromEntries(NEVER.filter((k) => typeof stored?.never?.[k] === 'boolean').map((k) => [k, stored.never[k]])) } };
+  return { ...d, sites: { mode: stored?.sites?.mode === 'only' && allow.length ? 'only' : 'any', allow, block }, approval: APPROVAL.includes(stored?.approval) ? stored.approval : d.approval, never: { ...d.never, ...Object.fromEntries(NEVER.filter((k) => typeof stored?.never?.[k] === 'boolean').map((k) => [k, stored.never[k]])) }, google: typeof stored?.google === 'boolean' ? stored.google : d.google };
 }
 
 // May Agent work on this page? -> '' or the reason it may not
@@ -100,6 +103,7 @@ export function applyRules(rules, steps) {
       const why = target ? siteProblem(rules, target) : '';
       if (why) { removed.push(why); continue; }
     }
+    if (GOOGLE_STEPS.has(st.do) && rules.google === false) { removed.push('Your office’s rules don’t let Agent use Google accounts.'); continue; }
     const hit = [...stepKinds(st)].find((k) => rules.never[k]);
     if (hit) { removed.push(`Your office’s rules don’t let Agent ${NEVER_SAY[hit]} (“${String(st.label || '').slice(0, 60)}”).`); continue; }
     kept.push(st);
