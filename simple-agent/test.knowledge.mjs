@@ -15,6 +15,7 @@ let down = false;
 function match(row, params) {
   for (const [k, v] of params) {
     if (['select', 'order', 'limit'].includes(k)) continue;
+    if (k === 'or') { const any = v.replace(/^\(|\)$/g, '').split(',').some((c) => { const [col, , ...val] = c.split('.'); return String(row[col] ?? '') === val.join('.'); }); if (!any) return false; continue; }
     const m = /^eq\.(.*)$/.exec(v); if (m && String(row[k] ?? '') !== m[1]) return false;
   }
   return true;
@@ -142,7 +143,8 @@ check('title tidied (control characters, extra spaces)', (await kn.addNote(ana, 
 
 // ---- who sees what
 const sl = await kn.list(sam), ol = await kn.list(owner), al = await kn.list(ana), xl = await kn.list(other);
-check('employee sees only what they sent', sl.items.length === 1 && sl.items[0].title === 'Henderson pays net-30' && sl.items[0].mine);
+check('employee sees what they sent, plus the business\'s approved items (not others\' waiting ones)', sl.items.some((i) => i.title === 'Henderson pays net-30' && i.mine) && sl.items.filter((i) => !i.mine).every((i) => i.status === 'approved') && sl.items.some((i) => !i.mine && i.status === 'approved') && !sl.items.some((i) => i.title === 'Big job'), sl.items.map((i) => [i.title, i.status, i.mine]));
+check('employee can open an approved item the owner added', await (async () => { const a = sl.items.find((i) => !i.mine && i.status === 'approved'); return a && (await kn.read(sam, a.id)).item?.body.length > 0; })());
 check('owner sees the whole business', ol.items.length === 3);
 check('another business sees none of it', xl.items.length === 0);
 check('another employee doesn\'t see Sam\'s', !al.items.some((i) => i.title.startsWith('Henderson')));
@@ -175,7 +177,7 @@ check('rejected never reaches the AI', !(await kn.forPlan('100', 'discount for e
 // ---- removing
 check('employee can\'t remove an approved item (it\'s the business\'s now)', (await kn.remove(sam, n1.id)).error === 'owner_only');
 check('employee can remove their own rejected item', (await kn.remove(sam, n3.id)).ok && !db.office_knowledge.some((r) => r.id === n3.id));
-check('employee can\'t remove someone else\'s', (await kn.remove(ana, n1.id)).error === 'not_found');
+check('employee can\'t remove someone else\'s (even once everyone can see it)', (await kn.remove(ana, n1.id)).error === 'owner_only' && db.office_knowledge.some((r) => r.id === n1.id));
 const n4 = await kn.addNote(sam, { title: 'Oops', text: 'sent by mistake' });
 check('employee can take back a waiting one', (await kn.remove(sam, n4.id)).ok);
 

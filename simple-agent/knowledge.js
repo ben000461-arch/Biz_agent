@@ -236,10 +236,12 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
     return r.ok ? r.rows.length : 0;
   }
 
-  // owner: the whole business (waiting first, newest first). employee: only what they sent.
+  // owner: the whole business. employee: what they sent (any status) plus everything approved, since approved
+  // items are the business's facts that Agent uses for everyone. Others' waiting or turned-down items stay hidden.
+  const seeable = (m) => owner(m) ? '' : `&or=(user_id.eq.${m.userId},status.eq.approved)`;
   async function list(m) {
     if (!enabled || !okMember(m)) return { error: 'unavailable' };
-    const who = owner(m) ? '' : `&user_id=eq.${m.userId}`;
+    const who = seeable(m);
     const r = await rest(`office_knowledge?chat_id=eq.${m.chatId}${who}&select=${COLS}&order=ts.desc&limit=${LIMITS.listMax}`);
     if (!r.ok) return { error: 'unavailable' };
     const items = r.rows.map((x) => ({ ...out(x), mine: x.user_id === m.userId }));
@@ -248,7 +250,7 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
 
   async function getOne(m, id) {
     if (!UUID_RE.test(String(id))) return { error: 'not_found' };
-    const who = owner(m) ? '' : `&user_id=eq.${m.userId}`;
+    const who = seeable(m);
     const r = await rest(`office_knowledge?id=eq.${id}&chat_id=eq.${m.chatId}${who}&select=${COLS},body,path,mime&limit=1`);
     if (!r.ok) return { error: 'unavailable' };
     return r.rows[0] ? { row: r.rows[0] } : { error: 'not_found' };
@@ -337,7 +339,7 @@ export function createKnowledge({ url, key, fetchImpl = globalThis.fetch, timeou
     return { ok: true };
   }
 
-  // the original file, for the owner (or the person who sent it)
+  // the original file: for the owner, the person who sent it, or anyone once it's approved
   async function download(m, id) {
     if (!enabled || !okMember(m)) return { error: 'unavailable' };
     const g = await getOne(m, id);

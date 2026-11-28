@@ -59,6 +59,7 @@ import { mountWebApi } from './webapi.js';
 import { createOffice } from './office.js';
 import { createKnowledge } from './knowledge.js';
 import { siteProblem, applyRules } from './rules.js';
+import { googleKey, googlePrompt, wantsCalendar, cleanGoogleStep } from './officegoogle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2570,7 +2571,7 @@ const bad = (message) => ({ status: 400, body: { error: 'invalid', message } });
 
 const webOps = {
   // The "Agent" browser extension: plan steps for the page the employee is on (nothing runs until they approve).
-  async agentPlan(tenant, b) {
+  async agentPlan(tenant, b, userId = '') {
     const request = String(b.request || '').trim();
     if (!request) return { status: 400, body: { error: 'empty', message: 'Type what you want done on this page.' } };
     if (request.length > 1000) return { status: 400, body: { error: 'too_long', message: 'That request is too long. Keep it under 1,000 characters.' } };
@@ -2590,7 +2591,19 @@ const webOps = {
     const history = cleanHistory(b.history);
     // what this business has told Agent (owner-approved only), when it fits what's being asked
     const facts = await knowledge.forPlan(tenant.chatId, [request, ...history.filter((h) => h.who === 'you').map((h) => h.text)].join(' '));
-    const extra = { failure: cleanFailure(b.failure), url: typeof b.page?.url === 'string' ? b.page.url : '', knowledge: facts };
+    // this person's own Google (officegoogle.js), if they connected it and the office allows it. Their calendar is
+    // read only when the request is about their schedule, and only the next 7 days.
+    let gctx = null, gtext = '';
+    if (google && rules && rules.google !== false && userId && google.isConnected(googleKey(userId))) {
+      const key = googleKey(userId), now = new Date(), tz = tenantTz(tenant);
+      gctx = { tz, now };
+      let events = null;
+      if (wantsCalendar([request, ...history.filter((h) => h.who === 'you').map((h) => h.text)].join(' '))) {
+        try { events = await google.eventsBetween(key, now.toISOString(), new Date(now.getTime() + 7 * 864e5).toISOString(), 40); } catch { events = 'unavailable'; }
+      }
+      gtext = googlePrompt({ tz, now, events, email: google.connectedEmail(key) || '' });
+    }
+    const extra = { failure: cleanFailure(b.failure), url: typeof b.page?.url === 'string' ? b.page.url : '', knowledge: facts, google: gtext };
     // With a screenshot and a model that can see, plan from the picture + the list; otherwise (or if that model
     // fails) plan from the list alone, exactly as before. The picture is used for this one call and never kept.
     const shot = cleanShot(b.screenshot);
@@ -2620,7 +2633,7 @@ const webOps = {
           : { status: 503, body: { error: 'model', message: "Couldn't reach the AI model right now. Nothing was changed." } };
       }
     }
-    const plan = checkPlan(data, c.snapshot, round);
+    const plan = checkPlan(data, c.snapshot, round, { google: gctx });
     // the office's rules: forbidden steps come out, and the approval setting decides what may run on its own
     let ruleNotes = [], askEvery = false;
     if (rules) {
@@ -2650,6 +2663,60 @@ const webOps = {
       detail: `${host || 'page'} · ${n(b.done)}/${n(b.total)} step${n(b.total) === 1 ? '' : 's'} done${outcome === 'cancelled' ? ' (cancelled)' : ''}${b.auto === true ? ' (ran on its own)' : ''}`,
     });
     return { body: { ok: true } };
+  },
+  // Run one approved Google step (save a Gmail draft / add a calendar event) on this person's own Google.
+  // Everything is checked again here: the step, the office's rules, and that they're connected.
+  async agentGoogle(tenant, b, userId) {
+    if (!google || !office.enabled || !userId) return { status: 404, body: { error: 'off', message: 'Google isn’t set up for Agent yet.' } };
+    const rules = await office.rulesFor(tenant.chatId);
+    if (rules?.error) return { status: 503, body: { error: 'rules', message: 'Couldn’t check your office’s rules right now. Nothing was saved.' } };
+    if (!rules) return { status: 404, body: { error: 'off', message: 'Google steps are for offices.' } };
+    if (rules.google === false) return { status: 403, body: { error: 'rule_google', message: 'Your office’s rules don’t let Agent use Google accounts. Nothing was saved.' } };
+    const key = googleKey(userId);
+    if (!google.isConnected(key)) return { status: 409, body: { error: 'not_connected', message: 'Connect your Google on your Account page first. Nothing was saved.' } };
+    const tz = tenantTz(tenant);
+    const g = cleanGoogleStep(b?.step, { tz, now: new Date() });
+    if (g.error) return { status: 400, body: { error: 'step', message: `That step can’t run: ${g.error}. Nothing was saved.` } };
+    const st = g.step;
+    try {
+      if (st.do === 'gmail_draft') {
+        await google.createDraft(key, { to: st.to, subject: st.subject, body: st.value });
+        logEvent(tenant, { kind: 'action', action: 'agent_google', status: 'done', detail: 'gmail draft' });
+        return { body: { ok: true, message: 'Saved in your Gmail drafts. It wasn’t sent.' } };
+      }
+      let clash = [];
+      try { clash = (await google.eventsBetween(key, st.start, st.end, 5)).filter((e) => !e.allDay); } catch { clash = []; }
+      await google.createEvent(key, { title: st.value, startISO: st.start, endISO: st.end, tz });
+      logEvent(tenant, { kind: 'action', action: 'agent_google', status: 'done', detail: 'calendar event' });
+      const note = clash.length ? ` Heads up: it overlaps ${clash.slice(0, 2).map((e) => `“${String(e.title).slice(0, 60)}”`).join(' and ')}.` : '';
+      return { body: { ok: true, message: `Added to your calendar.${note}` } };
+    } catch (err) {
+      if (err instanceof NeedsReconnect || err instanceof NeedsMoreAccess) return { status: 409, body: { error: 'reconnect', message: 'Your Google connection needs to be set up again. Reconnect it on your Account page. Nothing was saved.' } };
+      return { status: 502, body: { error: 'google', message: 'Google didn’t answer just now. Nothing was saved. Try again in a minute.' } };
+    }
+  },
+  // ---- Office: each person's own Google (Account page)
+  async officeGoogle(member) {
+    if (!google) return { body: { available: false } };
+    const rules = await office.rulesFor(member.chatId);
+    const key = googleKey(member.userId);
+    const connected = google.isConnected(key);
+    return { body: { available: true, allowed: !(rules && !rules.error && rules.google === false), connected, email: connected ? google.connectedEmail(key) : null } };
+  },
+  async officeGoogleConnect(member) {
+    if (!google) return { status: 404, body: { error: 'off', message: 'Google isn’t set up yet.' } };
+    const rules = await office.rulesFor(member.chatId);
+    if (rules?.error) return { status: 503, body: { error: 'rules', message: 'Couldn’t check your office’s rules right now. Try again in a moment.' } };
+    if (rules?.google === false) return { status: 403, body: { error: 'rule_google', message: 'Your office’s owner has turned Google off for Agent.' } };
+    return { body: { url: google.startSignIn(googleKey(member.userId), { back: 'office' }) } };
+  },
+  async officeGoogleDisconnect(member) {
+    if (google) await google.disconnect(googleKey(member.userId));
+    return { body: { ok: true } };
+  },
+  // someone left the office: their Google goes with them
+  async forgetPersonGoogle(userId) {
+    try { if (google && userId) await google.disconnect(googleKey(userId)); } catch { /* best effort */ }
   },
   // what is linked, for the Tools page (never a token, only yes/no and a name)
   async connections(tenant) {
@@ -2820,14 +2887,22 @@ mountWebApi(app, {
 // Where Google sends people back after they approve. The `state` value ties
 // the visit to the chat that asked for the link.
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// where people in an office go back to after connecting Google (their Account page)
+const OFFICE_APP_URL = (() => { try { const u = new URL(process.env.OFFICE_APP_URL || 'https://www.co-optech.com/office/'); return /^https?:$/.test(u.protocol) ? u.href.split(/[?#]/)[0] : 'https://www.co-optech.com/office/'; } catch { return 'https://www.co-optech.com/office/'; } })();
 const page = (title, msg) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><body style="font-family:system-ui;max-width:420px;margin:15vh auto;padding:0 20px;text-align:center"><h2>${esc(title)}</h2><p>${esc(msg)}</p></body>`;
 
 app.get('/oauth/google/callback', async (req, res) => {
   res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
   if (!google) return res.status(404).send(page('Not available', 'Connections are not set up on this server.'));
   const { code, state, error } = req.query;
+  // someone in an office connecting their own Google: send them back to the Office dashboard, never to a chat
+  const toOffice = (result) => res.redirect(302, `${OFFICE_APP_URL}?google=${result}#account`);
   if (error || typeof code !== 'string' || typeof state !== 'string') {
+    if (typeof state === 'string' && google.peekBack(state) === 'office') { google.dropState(state); return toOffice('cancelled'); }
     return res.status(400).send(page('Not connected', 'The sign-in was cancelled. To try again, type connect in your agent chat.'));
+  }
+  if (google.peekBack(state) === 'office') {
+    try { await google.finishSignIn(state, code); return toOffice('connected'); } catch (err) { console.error('Office Google sign-in failed:', redact(err.message, 200)); return toOffice('failed'); }
   }
   try {
     const { chatId, email } = await google.finishSignIn(state, code);

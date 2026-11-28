@@ -10,6 +10,7 @@
 //   POST /web/account/delete      { confirm: "DELETE" } delete the account and its data (see account.js)
 //   POST /web/agent/plan          { request, page } plan steps for the Agent extension (see agentpage.js)
 //   POST /web/agent/log           { url, outcome, done, total } what happened after the plan (counts only)
+//   POST /web/agent/google        { step } run one approved Gmail-draft / calendar step on the person's own Google
 //
 // Same rules as the chat door: the login is checked with Supabase on every request, the person is whoever Supabase
 // says, only the website's own address may call it, and requests are rate limited. This file only does the
@@ -95,8 +96,10 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   };
   const bigJson = express.json({ limit: '256kb' }); // a page snapshot is bigger than a normal request
   const planJson = express.json({ limit: '2mb' }); // ...and a plan may also carry one screenshot
-  router.options(['/agent/plan', '/agent/log'], corsAgent, (_req, res) => res.status(204).end());
-  router.post('/agent/plan', corsAgent, limitIp, planJson, whoAgent, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {})));
+  router.options(['/agent/plan', '/agent/log', '/agent/google'], corsAgent, (_req, res) => res.status(204).end());
+  router.post('/agent/plan', corsAgent, limitIp, planJson, whoAgent, run((req) => ops.agentPlan(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId)));
+  // run one approved Google step (Gmail draft / calendar event) on the person's own Google (officegoogle.js)
+  router.post('/agent/google', corsAgent, limitIp, bigJson, whoAgent, run((req) => (ops.agentGoogle ? ops.agentGoogle(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId) : { status: 404, body: { error: 'off' } })));
   router.post('/agent/log', corsAgent, limitIp, bigJson, whoAgent, run((req) => ops.agentLog(req.tenant, req.body && typeof req.body === 'object' ? req.body : {}, req.userId)));
 
   // ---- the Office dashboard (owner / employee). Signed in with the same login; reads only that person's
@@ -127,7 +130,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     }
   };
   const person = (req) => (/^[0-9a-f-]{36}$/i.test(String(req.query.person || '')) ? String(req.query.person) : '');
-  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name', '/office/knowledge', '/office/knowledge/item', '/office/knowledge/file', '/office/knowledge/note', '/office/knowledge/upload', '/office/knowledge/review', '/office/knowledge/remove', '/office/rules'], cors, (_req, res) => res.status(204).end());
+  router.options(['/office/me', '/office/activity', '/office/summary', '/office/team', '/office/team/invite', '/office/team/resend', '/office/team/remove', '/office/me/name', '/office/knowledge', '/office/knowledge/item', '/office/knowledge/file', '/office/knowledge/note', '/office/knowledge/upload', '/office/knowledge/review', '/office/knowledge/remove', '/office/rules', '/office/google', '/office/google/connect', '/office/google/disconnect'], cors, (_req, res) => res.status(204).end());
   router.get('/office/me', cors, limitIp, whoOffice, run(async (req) => {
     const b = await office.business(req.member.chatId);
     // only an owner whose business also signed up for Agent gets the link over to the Agent dashboard
@@ -185,7 +188,7 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
   }));
   router.post('/office/team/remove', cors, limitIp, json, whoOffice, run(async (req) => {
     const r = await office.remove(req.member, String(req.body?.memberId ?? ''));
-    if (r.ok && r.userId) auth.forgetLink?.(r.userId); // cut the extension off right away too
+    if (r.ok && r.userId) { auth.forgetLink?.(r.userId); ops.forgetPersonGoogle?.(r.userId); } // cut the extension off right away, and their Google goes too
     return r.error ? teamOut(r) : { body: { ok: true } };
   }));
   // ---- Rules (rules.js): everyone in the office can read them; only the owner changes them.
@@ -206,6 +209,12 @@ export function mountWebApi(app, { express, auth, getTenant, ops, office = null,
     if (r.error) return { status: r.error === 'owner_only' ? 403 : 400, body: { error: r.error, message: (RULE_ERR[r.error] || (() => 'Couldn’t save those rules.'))(r) } };
     return { body: { ok: true, rules: r.rules } };
   }));
+
+  // ---- Google: each person connects their own (officegoogle.js). The owner can turn it off in Rules.
+  const noGoogle = { status: 404, body: { error: 'off', message: 'Google isn’t set up yet.' } };
+  router.get('/office/google', cors, limitIp, whoOffice, run((req) => (ops.officeGoogle ? ops.officeGoogle(req.member) : { body: { available: false } })));
+  router.post('/office/google/connect', cors, limitIp, json, whoOffice, run((req) => (ops.officeGoogleConnect ? ops.officeGoogleConnect(req.member) : noGoogle)));
+  router.post('/office/google/disconnect', cors, limitIp, json, whoOffice, run((req) => (ops.officeGoogleDisconnect ? ops.officeGoogleDisconnect(req.member) : noGoogle)));
 
   // ---- Knowledge: notes and files for Agent. Employees' wait for the owner's approval (knowledge.js).
   const KN_ERR = {
